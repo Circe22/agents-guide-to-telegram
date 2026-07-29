@@ -119,6 +119,19 @@ def _text(body: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": body}]}
 
 
+def _text_error(body: str) -> dict[str, Any]:
+    """工具**执行**失败的正确返回姿势（MCP 规范）。
+
+    Telegram 拒收、没配 token、参数写错——这些是"工具跑了但没成"，属于**执行错误**，
+    要放进正常结果里标 `isError: true`，模型才读得到原因、自己改了重试。
+    JSON-RPC error 留给**协议层**问题（未知方法、params 不是对象、工具名不存在）——
+    那种错误模型改不了，抛给 host 才对。
+
+    出口一样过脱敏：**每条出口都要过**，不是只包网络那一段。
+    """
+    return {"content": [{"type": "text", "text": _scrub_out(body)}], "isError": True}
+
+
 # ---------- 核心 ----------
 def build_rich(args: dict[str, Any]) -> dict[str, Any]:
     """把工具参数拼成 InputRichMessage。三选一的约束在这里守。"""
@@ -394,6 +407,8 @@ TOOLS = (
     },
 )
 
+KNOWN_TOOLS = frozenset(tool["name"] for tool in TOOLS)
+
 INSTRUCTIONS = (
     "要发表格、LaTeX 公式、折叠块、勾选清单或长报告时，用 tg_rich_send"
     "（普通的 telegram 发送工具做不到这些）；纯文字聊天照旧走原来的发送工具。\n"
@@ -435,10 +450,15 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             return _error(request_id, -32602, "arguments must be an object")
+        if name not in KNOWN_TOOLS:
+            # 工具名不存在＝协议层问题，模型改不了，抛给 host
+            return _error(request_id, -32602, f"unknown tool: {name}")
         try:
             return _result(request_id, _call(name, arguments))
         except (RuntimeError, ValueError, OSError) as exc:
-            return _error(request_id, -32602, str(exc))
+            # 跑了但没成（API 拒收 / 缺 token / 参数写错）＝执行错误，
+            # 放进正常结果标 isError，模型读得到原因、能自己改了重试
+            return _result(request_id, _text_error(str(exc)))
     if request_id is None:
         return None
     return _error(request_id, -32601, "method not found")
