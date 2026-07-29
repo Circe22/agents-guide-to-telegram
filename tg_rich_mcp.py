@@ -100,7 +100,10 @@ def _scrub_out(message: str) -> str:
         message = _scrub(message, _token())
     except Exception:
         pass
-    return re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{30,}", "<token>", message)
+    # 不能用 \b 开头：真实 URL 长这样 api.telegram.org/bot123456789:AA…，
+    # "bot" 的 t 和数字之间**没有词边界**，\b 会让最常见的那种泄漏原样漏过去
+    # （异常消息里带整条 URL 正是最典型的泄漏场景）。改成"前面不是数字"即可。
+    return re.sub(r"(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}", "<token>", message)
 
 
 # ---------- JSON-RPC 小工具 ----------
@@ -447,7 +450,11 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
         return _result(request_id, {"tools": list(TOOLS)})
     if method == "tools/call":
         name = str(params.get("name") or "")
-        arguments = params.get("arguments") or {}
+        # 别写 `or {}`：那样 [] / "" / 0 会被静默当成"没给参数"放过去，
+        # 只有非空的错误类型才拦得住。缺省只有 None 一种。
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
         if not isinstance(arguments, dict):
             return _error(request_id, -32602, "arguments must be an object")
         if name not in KNOWN_TOOLS:
