@@ -426,11 +426,20 @@ INSTRUCTIONS = (
 
 def handle(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
-    request_id = message.get("id")
 
-    if method == "notifications/initialized":
+    # 没有 id ＝ notification，不期待任何响应。这个判断必须在分发**之前**：
+    # 放在最后的话，`{"method":"tools/list"}` 会先被执行、再回一条 id=null 的响应；
+    # 更糟的是有人把 tools/call 当 notification 发进来——消息真发出去了，
+    # 调用方却拿不到任何结果。（本 server 不消费任何客户端通知。）
+    if "id" not in message:
         return None
-    params = message.get("params") or {}
+    request_id = message["id"]
+
+    # 别写 `or {}`：那样 [] / "" / 0 会被静默当成"没给 params"，
+    # 后面的类型检查根本看不到原始的错误类型。缺省只有 None 一种。
+    params = message.get("params")
+    if params is None:
+        params = {}
     if not isinstance(params, dict):
         # 合法 JSON 但 params 是数组时，下面的 .get() 会 AttributeError 掀掉整个 server
         return _error(request_id, -32602, "params must be an object")
@@ -467,9 +476,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
             # 跑了但没成（API 拒收 / 缺 token / 参数写错）＝执行错误，
             # 放进正常结果标 isError，模型读得到原因、能自己改了重试
             return _result(request_id, _text_error(str(exc)))
-    if request_id is None:
-        return None
-    return _error(request_id, -32601, "method not found")
+    return _error(request_id, -32601, "method not found")   # notification 已在开头挡掉
 
 
 def main() -> None:

@@ -93,10 +93,20 @@ class Redaction(unittest.TestCase):
             with self.subTest(benign=benign):
                 self.assertEqual(mcp._scrub_out(benign), benign)
 
-    def test_one_source_of_truth_for_the_token_shape(self):
-        """hook 里那份是 import 失败时的兜底副本——两者漂移过一次，别再漂。"""
-        self.assertEqual(hook._TELEGRAM_TOKEN_RE.pattern,
+    def test_fallback_copy_matches_source_of_truth(self):
+        """盯的必须是**副本的字面量**。
+
+        比 `hook._TELEGRAM_TOKEN_RE.pattern` 是没用的：测试环境下 import 一定成功，
+        那个名字就是共享对象本身，等于断言 A == A——副本改回 `\\b\\d{8,}` 也照绿。
+        """
+        self.assertEqual(hook._FALLBACK_TELEGRAM_TOKEN_PATTERN,
                          secret_redaction.TELEGRAM_BOT_TOKEN_RE.pattern)
+
+    def test_fallback_copy_actually_works(self):
+        """副本自己也得真拦得住，不能只是长得一样。"""
+        fallback = __import__("re").compile(hook._FALLBACK_TELEGRAM_TOKEN_PATTERN)
+        self.assertTrue(fallback.search(LEAK_URL))
+        self.assertFalse(fallback.search("chat_id=-1001234567890"))
 
     def test_scrub_is_idempotent(self):
         once = mcp._scrub_out("bot987654321:BB" + "y" * 33)
@@ -147,15 +157,46 @@ class Protocol(unittest.TestCase):
         reply = rpc("initialize", {"protocolVersion": "2099-01-01"})
         self.assertEqual(reply["result"]["protocolVersion"], mcp.PROTOCOL_VERSION)
 
-    def test_params_array_does_not_crash_the_server(self):
-        """合法 JSON 但 params 是数组——以前这里 AttributeError 掀掉整个 server。"""
+    def test_params_array_is_rejected_as_wrong_type(self):
+        """合法 JSON 但 params 是数组——以前这里 AttributeError 掀掉整个 server。
+
+        断言要盯到**具体错误**：只查 "error" in reply 的话，`params or {}` 那种
+        静默转换也会让它绿（最后因为工具名为空报了 unknown tool，理由完全不对）。
+        """
         reply = mcp.handle({"jsonrpc": "2.0", "id": 1,
                             "method": "tools/call", "params": []})
-        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertEqual(reply["error"]["message"], "params must be an object")
+
+    def test_falsy_params_are_not_silently_accepted(self):
+        for bad in ["", 0, []]:
+            with self.subTest(bad=repr(bad)):
+                reply = mcp.handle({"jsonrpc": "2.0", "id": 1,
+                                    "method": "tools/call", "params": bad})
+                self.assertEqual(reply["error"]["message"], "params must be an object")
 
     def test_notifications_get_no_reply(self):
         self.assertIsNone(mcp.handle({"jsonrpc": "2.0",
                                       "method": "notifications/initialized"}))
+
+    def test_known_method_without_id_gets_no_reply(self):
+        """没有 id ＝ notification。以前会先执行、再回一条 id=null 的响应；
+        更糟的是 tools/call 当 notification 发进来——消息真发出去，调用方拿不到结果。"""
+        for method in ["tools/list", "initialize", "ping"]:
+            with self.subTest(method=method):
+                self.assertIsNone(mcp.handle({"jsonrpc": "2.0", "method": method}))
+
+    def test_tools_call_as_notification_does_not_execute(self):
+        sent = []
+        original, mcp.call_api = mcp.call_api, lambda m, d: sent.append(m)
+        try:
+            reply = mcp.handle({"jsonrpc": "2.0", "method": "tools/call",
+                                "params": {"name": "tg_rich_send",
+                                           "arguments": {"markdown": "hi"}}})
+        finally:
+            mcp.call_api = original
+        self.assertIsNone(reply)
+        self.assertEqual(sent, [], "notification 不该真把消息发出去")
 
     def test_tools_list_matches_known_tools(self):
         names = {t["name"] for t in rpc("tools/list")["result"]["tools"]}
@@ -286,6 +327,38 @@ class FrameOrdering(unittest.TestCase):
         self.write({"msg_id": 42, "seq": 9, "lines": ["new"], "total": 9})
         hook._push(self.path, seq=9)
         self.assertEqual(self.calls, ["editMessageText"])
+
+    def test_slow_old_frame_cannot_land_after_a_newer_one(self):
+        """光在出发前查 seq 挡不住这个：查完之后、请求返回之前，新帧可能已经发完了。
+
+        这里让旧帧的请求很慢、新帧的很快——没有推送锁的话，新帧先落地、
+        旧帧后落地，窗口就倒退回旧内容了。
+        """
+        import threading
+        import time
+
+        order = []
+
+        def timed_api(method, data):
+            payload = json.loads(data["rich_message"])
+            tag = payload["blocks"][1]["items"][0]["blocks"][0]["text"]
+            time.sleep(0.30 if tag == "frame-1" else 0.01)
+            order.append(tag)
+            return {"result": {"message_id": 42}}
+
+        mcp.call_api = timed_api
+        self.write({"msg_id": 42, "seq": 1, "lines": ["frame-1"], "total": 1})
+        old = threading.Thread(target=hook._push, args=(self.path, 1))
+        old.start()
+        time.sleep(0.05)                       # 让慢的那帧先进锁
+        self.write({"msg_id": 42, "seq": 2, "lines": ["frame-2"], "total": 2})
+        new = threading.Thread(target=hook._push, args=(self.path, 2))
+        new.start()
+        old.join(timeout=10)
+        new.join(timeout=10)
+
+        self.assertTrue(order, "一帧都没发出去")
+        self.assertEqual(order[-1], "frame-2", "旧帧最后落地＝窗口倒退")
 
     def test_only_the_claiming_frame_opens_the_window(self):
         """并发的几帧都发现没有 msg_id 时，只有被派活的那帧能发。"""

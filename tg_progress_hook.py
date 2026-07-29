@@ -96,12 +96,15 @@ DIRTY = (
     "private_key", "authorization", ".env", "id_rsa", "cookie", "session_key",
 )
 
+# 副本的**字面量**必须单独拿出来：写在 except 里的话，测试环境下 import 总是成功，
+# 比对的就变成"共享对象 == 共享对象"（永真），副本改坏了也没人知道。
+_FALLBACK_TELEGRAM_TOKEN_PATTERN = r"(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}"
+
 try:
     from secret_redaction import TELEGRAM_BOT_TOKEN_RE as _TELEGRAM_TOKEN_RE
 except Exception:      # noqa: BLE001
-    # 铁律①：少一个文件也不能让 hook 崩掉工具调用。这份副本必须和
-    # secret_redaction.py 里的一字不差——测试会盯着两者是否漂移。
-    _TELEGRAM_TOKEN_RE = re.compile(r"(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}")
+    # 铁律①：少一个文件也不能让 hook 崩掉工具调用。
+    _TELEGRAM_TOKEN_RE = re.compile(_FALLBACK_TELEGRAM_TOKEN_PATTERN)
 
 # 闸二：形态。关键词闸只拦「说出'密钥'两个字」，拦不住密钥本身——
 # `deploy sk-live-ABC123XYZ`、文件名 `AKIAIOSFODNN7EXAMPLE` 都没有任何关键词。
@@ -283,7 +286,28 @@ def _rich(blocks: list[dict]) -> str:
 
 
 def _push(state_path: Path, seq: int = 0) -> int:
-    """子进程入口：把状态文件里的行推出去。失败静默。"""
+    """子进程入口：把状态文件里的行推出去。失败静默。
+
+    **整段持一把独立的推送锁。** 只在出发前看一眼 seq 是不够的——检查通过之后、
+    网络请求返回之前，更新的那一帧可能已经发完了，这一帧再落地就把窗口改回了旧内容
+    （用户眼里就是进度倒退）。加锁之后两条路都安全：旧帧先拿到锁就先发、新帧随后覆盖；
+    新帧先拿到锁的话，旧帧拿到锁时**在锁内重读**状态，发现 seq 过期直接退出。
+
+    锁必须**独立于主状态锁**：主锁是每次工具调用都要拿的，把网络请求塞进那把锁里，
+    等于让 Telegram 的延迟拖住 agent 干活（铁律②）。
+    """
+    lock_path = Path(str(state_path) + ".push.lock")
+    try:
+        with open(lock_path, "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            _push_locked(state_path, seq)
+    except Exception:
+        pass          # 铁律①：推送失败绝不影响 agent
+    return 0
+
+
+def _push_locked(state_path: Path, seq: int = 0) -> int:
+    """真正干活的那半——**必须在推送锁里调用**，状态也必须在锁内重读。"""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from tg_rich_mcp import _default_chat, call_api, tool_draft  # noqa: PLC0415
@@ -293,8 +317,7 @@ def _push(state_path: Path, seq: int = 0) -> int:
         total = int(state.get("total") or 0)
 
         if _mode() == "draft":
-            # 帧序：几个推送子进程会并发落地，慢的那个会把旧内容盖回去（窗口倒退）。
-            # 出发时记下 seq，推之前再看一眼——已经有更新的帧了就让位，反正它马上到。
+            # 锁内重读之后再比 seq：已经有更新的帧了就让位，反正它马上到。
             if seq and int(state.get("seq") or 0) != seq:
                 return 0
             tool_draft({
