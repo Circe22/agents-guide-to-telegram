@@ -41,10 +41,20 @@ from secret_redaction import redact_telegram_tokens
 
 SERVER_NAME = "tg-rich"
 SERVER_VERSION = "1.0.0"
-PROTOCOL_VERSION = "2025-06-18"
+# 本 server 实现的是**握手式**（initialize/initialized）的 MCP，
+# 覆盖 2024-11-05 ~ 2025-11-25 这几版。
+#
+# ⚠️ **2026-07-28 那版不在此列**，而且不是"再加一个字符串"就能支持的：
+# 它把 MCP 改成了无状态协议——移除 initialize/notifications/initialized 握手，
+# 协议版本与客户端能力改为每个请求放在 `_meta` 里带；服务器 MUST 实现
+# `server/discover`；所有 result 必须带 `resultType`；`ping` / `logging/setLevel` 移除。
+# 见 <https://modelcontextprotocol.io/specification/2026-07-28> 的 Key Changes。
+# 好消息是它给了向后兼容的路：新客户端可以拿 `server/discover` 当探测，
+# 我们回 method not found，它就知道该按旧协议来。
+PROTOCOL_VERSION = "2025-11-25"
 # 版本协商：客户端要的版本我支持，就回同一个；不支持才回自己最新的、让它决定断不断
 # （规范要求双方在 initialize 时协商，写死一个版本会让严格的 host 直接断开）。
-SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 TG_API = "https://api.telegram.org"
 
 # 官方原文：Exactly one of the fields html, markdown, or blocks must be used.

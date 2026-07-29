@@ -12,7 +12,7 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 | 文件 | 是什么 | 通用性 |
 |---|---|---|
-| `tg_rich_mcp.py` | MCP server，三个工具：发 / 原地改 / 推草稿 | ✅ 任何 MCP host（Claude Code、Claude Desktop、Cursor、自己写的 agent） |
+| `tg_rich_mcp.py` | MCP server，三个工具：发 / 原地改 / 推草稿 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
 | `secret_redaction.py` | 密钥形态的单一真源，上面两个都用它 | 跟着走，别单独删 |
 | `test_tg_rich_mcp.py` | 39 个测试，`python3 -m unittest discover -v`，0.6 秒、不发网络 | — |
@@ -88,6 +88,26 @@ chmod 600 ~/.tg-rich-mcp.json
 ```
 
 只依赖 `requests`（`pip install requests`）。协议是手写的 JSON-RPC over stdio，不需要 mcp SDK。
+
+#### 支持哪几版 MCP 协议
+
+实现的是**握手式**（`initialize` / `notifications/initialized`）的 MCP，协商这四版：
+
+```
+2025-11-25 · 2025-06-18 · 2025-03-26 · 2024-11-05
+```
+
+客户端要的版本在这里面就回同一个，不在就回最新的那个、由它决定断不断。
+
+> ⚠️ **2026-07-28 那版不支持**，而且不是"再加一个字符串"就能支持的——它把 MCP 改成了
+> **无状态**协议：移除 `initialize` 握手，协议版本和客户端能力改为每个请求放进 `_meta`；
+> 服务器 MUST 实现 `server/discover`；所有 result 必须带 `resultType`；
+> `ping` / `logging/setLevel` 被移除。
+> （[Key Changes](https://modelcontextprotocol.io/specification/2026-07-28)）
+>
+> 好在它留了向后兼容的路：新客户端可以拿 `server/discover` 当探测，
+> 本 server 回 `method not found`，它就知道该按旧协议来。
+> 真要支持新协议是另一个工程，欢迎提 PR。
 
 ### 3. 挂进度窗 hook（可选，仅 Claude Code）
 
