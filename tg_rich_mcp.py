@@ -37,6 +37,8 @@ from typing import Any
 
 import requests
 
+from secret_redaction import redact_telegram_tokens
+
 SERVER_NAME = "tg-rich"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2025-06-18"
@@ -100,10 +102,9 @@ def _scrub_out(message: str) -> str:
         message = _scrub(message, _token())
     except Exception:
         pass
-    # 不能用 \b 开头：真实 URL 长这样 api.telegram.org/bot123456789:AA…，
-    # "bot" 的 t 和数字之间**没有词边界**，\b 会让最常见的那种泄漏原样漏过去
-    # （异常消息里带整条 URL 正是最典型的泄漏场景）。改成"前面不是数字"即可。
-    return re.sub(r"(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}", "<token>", message)
+    # 形态闸抹的是**别人的** token（调用方误塞进参数里的），精确替换够不着。
+    # 正则本身在 secret_redaction.py，单一真源——抄两份必然漂移，已经漂过一次。
+    return redact_telegram_tokens(message)
 
 
 # ---------- JSON-RPC 小工具 ----------

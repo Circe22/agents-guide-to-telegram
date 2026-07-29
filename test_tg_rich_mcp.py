@@ -27,8 +27,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import secret_redaction  # noqa: E402
 import tg_progress_hook as hook  # noqa: E402
 import tg_rich_mcp as mcp  # noqa: E402
+
+FAKE_TOKEN = "123456789:AAH" + "x" * 32
+LEAK_URL = f"https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage"
 
 
 def rpc(method: str, params: dict | None = None, request_id: int = 1):
@@ -72,9 +76,27 @@ class Redaction(unittest.TestCase):
     """出口脱敏。坏了就是把 token 递出去。"""
 
     def test_bot_token_shape_scrubbed(self):
-        dirty = "connection failed to api.telegram.org/bot123456789:AAH" + "x" * 32
-        self.assertNotIn("AAHx", mcp._scrub_out(dirty))
-        self.assertIn("<token>", mcp._scrub_out(dirty))
+        """真实泄漏长这样——token 紧贴在 "bot" 后面，中间没有词边界。"""
+        out = mcp._scrub_out(f"connection failed to {LEAK_URL}")
+        self.assertNotIn("AAHx", out)
+        self.assertIn("<token>", out)
+
+    def test_bare_and_prefixed_forms(self):
+        for text in [FAKE_TOKEN, f"token={FAKE_TOKEN}", f"bot{FAKE_TOKEN}", LEAK_URL]:
+            with self.subTest(text=text[:30]):
+                self.assertNotIn("AAHx", mcp._scrub_out(text))
+
+    def test_ordinary_numbers_survive(self):
+        """别为了认 token 把正常内容也抹了。"""
+        for benign in ["chat_id=-1001234567890", "timestamp=1722300000",
+                       "version=2025-06-18", "status 123456:short"]:
+            with self.subTest(benign=benign):
+                self.assertEqual(mcp._scrub_out(benign), benign)
+
+    def test_one_source_of_truth_for_the_token_shape(self):
+        """hook 里那份是 import 失败时的兜底副本——两者漂移过一次，别再漂。"""
+        self.assertEqual(hook._TELEGRAM_TOKEN_RE.pattern,
+                         secret_redaction.TELEGRAM_BOT_TOKEN_RE.pattern)
 
     def test_scrub_is_idempotent(self):
         once = mcp._scrub_out("bot987654321:BB" + "y" * 33)
@@ -175,6 +197,19 @@ class ToolSummaries(unittest.TestCase):
             with self.subTest(secret=secret):
                 self.assertIn("内容隐去",
                               hook._line("Bash", {"description": secret}))
+
+    def test_shape_gate_catches_telegram_token_inside_url(self):
+        """进度窗这侧漏过一次：MCP 的闸修好了，这道还敞着。"""
+        line = hook._line("Bash", {"description": f"request failed: {LEAK_URL}"})
+        self.assertIn("内容隐去", line)
+        self.assertNotIn(FAKE_TOKEN, line)
+
+    def test_shape_gate_does_not_hurt_normal_numbers(self):
+        for ordinary in ["chat_id=-1001234567890", "timestamp=1722300000",
+                         "version=2025-06-18", "status 123456:short"]:
+            with self.subTest(ordinary=ordinary):
+                self.assertNotIn("内容隐去",
+                                 hook._line("Bash", {"description": ordinary}))
 
     def test_grep_pattern_only_when_it_looks_ordinary(self):
         self.assertIn("handleRequest", hook._line("Grep", {"pattern": "handleRequest"}))

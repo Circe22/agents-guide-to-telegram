@@ -13,7 +13,9 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 | 文件 | 是什么 | 通用性 |
 |---|---|---|
 | `tg_rich_mcp.py` | MCP server，三个工具：发 / 原地改 / 推草稿 | ✅ 任何 MCP host（Claude Code、Claude Desktop、Cursor、自己写的 agent） |
-| `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制） |
+| `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
+| `secret_redaction.py` | 密钥形态的单一真源，上面两个都用它 | 跟着走，别单独删 |
+| `test_tg_rich_mcp.py` | 39 个测试，`python3 -m unittest discover -v`，0.6 秒、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、

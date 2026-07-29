@@ -96,6 +96,13 @@ DIRTY = (
     "private_key", "authorization", ".env", "id_rsa", "cookie", "session_key",
 )
 
+try:
+    from secret_redaction import TELEGRAM_BOT_TOKEN_RE as _TELEGRAM_TOKEN_RE
+except Exception:      # noqa: BLE001
+    # 铁律①：少一个文件也不能让 hook 崩掉工具调用。这份副本必须和
+    # secret_redaction.py 里的一字不差——测试会盯着两者是否漂移。
+    _TELEGRAM_TOKEN_RE = re.compile(r"(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}")
+
 # 闸二：形态。关键词闸只拦「说出'密钥'两个字」，拦不住密钥本身——
 # `deploy sk-live-ABC123XYZ`、文件名 `AKIAIOSFODNN7EXAMPLE` 都没有任何关键词。
 # 这道闸认长相，不认词。
@@ -106,7 +113,7 @@ SECRET_SHAPES = (
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),      # Slack
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\."),           # JWT
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY"),     # PEM
-    re.compile(r"\b\d{8,}:[A-Za-z0-9_-]{30,}"),       # Telegram bot token
+    _TELEGRAM_TOKEN_RE,                               # Telegram bot token（共享真源）
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),              # 长 hex
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}"),        # 长 base64
     re.compile(r"://[^/\s:]+:[^/\s@]+@"),             # URL 里的 user:pass@
