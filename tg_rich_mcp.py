@@ -40,6 +40,9 @@ import requests
 SERVER_NAME = "tg-rich"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2025-06-18"
+# 版本协商：客户端要的版本我支持，就回同一个；不支持才回自己最新的、让它决定断不断
+# （规范要求双方在 initialize 时协商，写死一个版本会让严格的 host 直接断开）。
+SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 TG_API = "https://api.telegram.org"
 
 # 官方原文：Exactly one of the fields html, markdown, or blocks must be used.
@@ -413,10 +416,11 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
         # 合法 JSON 但 params 是数组时，下面的 .get() 会 AttributeError 掀掉整个 server
         return _error(request_id, -32602, "params must be an object")
     if method == "initialize":
+        wanted = str(params.get("protocolVersion") or "")
         return _result(
             request_id,
             {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": wanted if wanted in SUPPORTED_PROTOCOLS else PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": INSTRUCTIONS,
