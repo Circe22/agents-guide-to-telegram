@@ -89,6 +89,14 @@ chmod 600 ~/.tg-rich-mcp.json
 
 ### 3. 挂进度窗 hook（可选，仅 Claude Code）
 
+> ⚠️ **进度窗 hook 需要 Linux / macOS / WSL。** 它用 `fcntl` 给状态文件加锁
+> （并发的工具调用会同时写同一个文件），而 `fcntl` 是 Unix-only ——
+> **原生 Windows 的 Python 一 import 就报错**。
+> Windows 用户请在 WSL 里跑 Claude Code，或者只用 MCP server 那半边（那半边全平台都行）。
+>
+> Progress hook requires Linux, macOS, or WSL (`fcntl` is Unix-only).
+> The MCP server itself runs anywhere.
+
 `.claude/settings.json`：
 
 ```json
