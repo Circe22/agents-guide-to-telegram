@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""tg-rich-mcp 的测试。
+
+跑：
+    python3 -m unittest discover -v          # 或 python3 test_tg_rich_mcp.py
+
+**一条网络请求都不发**，也不读你的真配置——`HOME` 全程指向临时目录。
+所以随便跑，不会往你的 Telegram 里发东西。
+
+测的是那些"坏了会伤到别人"的地方：
+  · 脱敏（坏了＝把密钥推进聊天里）
+  · 并发写状态（坏了＝进度窗丢行）
+  · 帧序（坏了＝窗口倒退）
+  · 三选一校验（坏了＝API 拒收，用户莫名其妙）
+  · 错误分类（坏了＝模型看不见原因，不会重试）
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import tg_progress_hook as hook  # noqa: E402
+import tg_rich_mcp as mcp  # noqa: E402
+
+
+def rpc(method: str, params: dict | None = None, request_id: int = 1):
+    return mcp.handle({"jsonrpc": "2.0", "id": request_id,
+                       "method": method, "params": params or {}})
+
+
+def call_tool(name: str, args: dict):
+    return rpc("tools/call", {"name": name, "arguments": args})
+
+
+class ContentFieldValidation(unittest.TestCase):
+    """markdown / html / blocks —— 官方原文 Exactly one。"""
+
+    def test_exactly_one_accepted(self):
+        for field, value in [("markdown", "# hi"), ("html", "<b>hi</b>"),
+                             ("blocks", [{"type": "paragraph", "text": "hi"}])]:
+            with self.subTest(field=field):
+                rich = mcp.build_rich({field: value})
+                self.assertEqual(list(rich), [field])
+
+    def test_zero_rejected(self):
+        with self.assertRaises(ValueError):
+            mcp.build_rich({})
+
+    def test_two_rejected(self):
+        with self.assertRaises(ValueError):
+            mcp.build_rich({"markdown": "x", "html": "<b>y</b>"})
+
+    def test_blocks_accepts_json_string(self):
+        """agent 经常把 blocks 序列化成字符串传进来，得认。"""
+        rich = mcp.build_rich({"blocks": '[{"type":"paragraph","text":"hi"}]'})
+        self.assertEqual(rich["blocks"][0]["type"], "paragraph")
+
+    def test_blocks_must_be_a_list(self):
+        with self.assertRaises(ValueError):
+            mcp.build_rich({"blocks": '{"type":"paragraph"}'})
+
+
+class Redaction(unittest.TestCase):
+    """出口脱敏。坏了就是把 token 递出去。"""
+
+    def test_bot_token_shape_scrubbed(self):
+        dirty = "connection failed to api.telegram.org/bot123456789:AAH" + "x" * 32
+        self.assertNotIn("AAHx", mcp._scrub_out(dirty))
+        self.assertIn("<token>", mcp._scrub_out(dirty))
+
+    def test_scrub_is_idempotent(self):
+        once = mcp._scrub_out("bot987654321:BB" + "y" * 33)
+        self.assertEqual(once, mcp._scrub_out(once))
+
+    def test_int_arg_never_echoes_the_value(self):
+        """校验异常也是出口：调用方可能刚好把 token 填错了位置。"""
+        token_like = "123456789:AA" + "z" * 33
+        with self.assertRaises(ValueError) as ctx:
+            mcp._int_arg({"draft_id": token_like}, "draft_id", "任意非零整数")
+        self.assertNotIn(token_like, str(ctx.exception))
+
+
+class ErrorClassification(unittest.TestCase):
+    """协议错误 vs 执行错误——分错了模型就不会自己重试。"""
+
+    def test_unknown_tool_is_protocol_error(self):
+        self.assertIn("error", call_tool("no_such_tool", {}))
+
+    def test_arguments_must_be_object(self):
+        reply = rpc("tools/call", {"name": "tg_rich_send", "arguments": []})
+        self.assertIn("error", reply)
+
+    def test_validation_failure_is_tool_error(self):
+        reply = call_tool("tg_rich_send", {"markdown": "x", "html": "<b>y</b>"})
+        self.assertTrue(reply["result"]["isError"])
+        self.assertIn("三选一", reply["result"]["content"][0]["text"])
+
+    def test_missing_message_id_is_tool_error(self):
+        reply = call_tool("tg_rich_edit", {"markdown": "x"})
+        self.assertTrue(reply["result"]["isError"])
+
+    def test_tool_error_text_is_scrubbed(self):
+        """执行错误也是出口。"""
+        marker = "555555555:CC" + "w" * 33
+        self.assertNotIn(marker, json.dumps(
+            mcp._text_error(f"boom {marker}"), ensure_ascii=False))
+
+
+class Protocol(unittest.TestCase):
+    def test_version_negotiation(self):
+        for wanted in mcp.SUPPORTED_PROTOCOLS:
+            with self.subTest(wanted=wanted):
+                reply = rpc("initialize", {"protocolVersion": wanted})
+                self.assertEqual(reply["result"]["protocolVersion"], wanted)
+
+    def test_unknown_version_falls_back(self):
+        reply = rpc("initialize", {"protocolVersion": "2099-01-01"})
+        self.assertEqual(reply["result"]["protocolVersion"], mcp.PROTOCOL_VERSION)
+
+    def test_params_array_does_not_crash_the_server(self):
+        """合法 JSON 但 params 是数组——以前这里 AttributeError 掀掉整个 server。"""
+        reply = mcp.handle({"jsonrpc": "2.0", "id": 1,
+                            "method": "tools/call", "params": []})
+        self.assertIn("error", reply)
+
+    def test_notifications_get_no_reply(self):
+        self.assertIsNone(mcp.handle({"jsonrpc": "2.0",
+                                      "method": "notifications/initialized"}))
+
+    def test_tools_list_matches_known_tools(self):
+        names = {t["name"] for t in rpc("tools/list")["result"]["tools"]}
+        self.assertEqual(names, set(mcp.KNOWN_TOOLS))
+        self.assertEqual(len(names), 3)
+
+
+class ToolSummaries(unittest.TestCase):
+    """进度窗只推工具名 + 一句安全摘要，绝不推内容。"""
+
+    def test_bash_uses_description_not_command(self):
+        line = hook._line("Bash", {"command": "curl -H 'Authorization: Bearer abc'",
+                                   "description": "拉一下接口"})
+        self.assertIn("拉一下接口", line)
+        self.assertNotIn("Authorization", line)
+
+    def test_read_shows_basename_only(self):
+        line = hook._line("Read", {"file_path": "/home/someone/vault/notes.md"})
+        self.assertIn("notes.md", line)
+        self.assertNotIn("/home/someone", line)
+
+    def test_filename_itself_can_be_the_secret(self):
+        self.assertIn("内容隐去",
+                      hook._line("Read", {"file_path": "/tmp/AKIAIOSFODNN7EXAMPLE"}))
+
+    def test_webfetch_drops_query_and_userinfo(self):
+        line = hook._line("WebFetch", {"url": "https://u:p@example.com/a?token=zzz"})
+        self.assertNotIn("token=zzz", line)
+        self.assertNotIn("u:p", line)
+
+    def test_keyword_gate(self):
+        self.assertIn("内容隐去", hook._line("Bash", {"description": "读 .env 文件"}))
+
+    def test_shape_gate_catches_keyless_secrets(self):
+        """关键词闸拦不住这些——它们一个关键词都没有。"""
+        for secret in ["deploy sk-live-ABC123XYZdef", "AKIAIOSFODNN7EXAMPLE",
+                       "ghp_" + "a" * 20, "eyJhbGciOiJIUzI1NiJ9.payload",
+                       "-----BEGIN RSA PRIVATE KEY"]:
+            with self.subTest(secret=secret):
+                self.assertIn("内容隐去",
+                              hook._line("Bash", {"description": secret}))
+
+    def test_grep_pattern_only_when_it_looks_ordinary(self):
+        self.assertIn("handleRequest", hook._line("Grep", {"pattern": "handleRequest"}))
+        self.assertNotIn("sk-live",
+                         hook._line("Grep", {"pattern": "sk-live-ABC123XYZdef"}))
+
+    def test_redaction_can_be_turned_off(self):
+        """闸必须能关——这是它的用户要求，不是可选项。"""
+        os.environ["TG_PROGRESS_REDACT"] = "0"
+        try:
+            self.assertIn("读 .env 文件",
+                          hook._line("Bash", {"description": "读 .env 文件"}))
+        finally:
+            os.environ.pop("TG_PROGRESS_REDACT", None)
+
+
+class ProgressBlocks(unittest.TestCase):
+    def test_thinking_block_only_in_draft(self):
+        """thinking 进不了正式消息，照搬会被 API 拒收。"""
+        kinds = [b["type"] for b in hook._blocks(["a"], 1, draft=True)]
+        self.assertIn("thinking", kinds)
+        for blocks in [hook._blocks(["a"], 1), hook._blocks(["a"], 1, done=True)]:
+            kinds = [b["type"] for b in blocks]
+            self.assertNotIn("thinking", kinds)
+            self.assertIn("footer", kinds)
+
+    def test_step_count_is_not_the_truncated_line_count(self):
+        """lines 截断在 40，拿 len(lines) 当步数会永远显示 40 步。"""
+        footer = hook._blocks([f"step {i}" for i in range(40)], 137)[-1]
+        self.assertIn("137", footer["text"])
+
+    def test_empty_lines_produce_no_empty_list_block(self):
+        kinds = [b["type"] for b in hook._blocks([], 0)]
+        self.assertNotIn("list", kinds)
+
+    def test_session_id_cannot_escape_the_state_dir(self):
+        """session_id 是外来输入，直接拼路径能用 ../ 跑出去写别处。"""
+        evil = hook._state_path("../../../../tmp/pwned")
+        self.assertEqual(evil.parent, hook.STATE_DIR)
+        self.assertNotIn("..", str(evil))
+
+
+class FrameOrdering(unittest.TestCase):
+    """慢帧不能把新内容盖回去（窗口倒退）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "state.json"
+        self.calls = []
+        self.original = mcp.call_api
+        mcp.call_api = lambda method, data: (
+            self.calls.append(method), {"result": {"message_id": 42}})[1]
+        # 没有 chat_id 的话 _push 会在发请求之前就早退，这几条就测不到东西了
+        self.had_chat = os.environ.get("TG_CHAT_ID")
+        os.environ["TG_CHAT_ID"] = "-100999"
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        if self.had_chat is None:
+            os.environ.pop("TG_CHAT_ID", None)
+        else:
+            os.environ["TG_CHAT_ID"] = self.had_chat
+        self.tmp.cleanup()
+
+    def write(self, state):
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_stale_frame_yields(self):
+        self.write({"msg_id": 42, "seq": 9, "lines": ["new"], "total": 9})
+        hook._push(self.path, seq=3)          # 出发时是第 3 帧，落地时已经第 9 帧
+        self.assertEqual(self.calls, [])
+
+    def test_current_frame_edits(self):
+        self.write({"msg_id": 42, "seq": 9, "lines": ["new"], "total": 9})
+        hook._push(self.path, seq=9)
+        self.assertEqual(self.calls, ["editMessageText"])
+
+    def test_only_the_claiming_frame_opens_the_window(self):
+        """并发的几帧都发现没有 msg_id 时，只有被派活的那帧能发。"""
+        self.write({"seq": 5, "claim": 5, "lines": ["a"], "total": 5})
+        hook._push(self.path, seq=4)          # 不是我的活
+        self.assertEqual(self.calls, [])
+        hook._push(self.path, seq=5)          # 是我的活
+        self.assertEqual(self.calls, ["sendRichMessage"])
+        self.assertEqual(json.loads(self.path.read_text())["msg_id"], 42)
+
+
+class ConcurrentStateWrites(unittest.TestCase):
+    """并行工具调用会同时写状态文件——无锁时后写的覆盖先写的。"""
+
+    def test_no_lines_lost_under_concurrency(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ, HOME=home, TG_PROGRESS_REDACT="1")
+            env.pop("TG_BOT_TOKEN", None)     # 确保推送子进程发不出去
+            env.pop("TG_CHAT_ID", None)
+            procs = []
+            for i in range(60):
+                event = json.dumps({"tool_name": "Read", "session_id": "concurrency",
+                                    "tool_input": {"file_path": f"/x/file{i}.py"}})
+                procs.append(subprocess.Popen(
+                    [sys.executable, str(HERE / "tg_progress_hook.py")],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, env=env, text=True))
+                procs[-1].stdin.write(event)
+                procs[-1].stdin.close()
+            for p in procs:
+                p.wait(timeout=30)
+
+            state_dir = Path(home) / ".tg-progress"
+            states = list(state_dir.glob("*.json"))
+            self.assertEqual(len(states), 1, "一个 session 应该只有一个状态文件")
+            state = json.loads(states[0].read_text(encoding="utf-8"))
+            self.assertEqual(state["total"], 60, "有帧被覆盖丢掉了")
+            self.assertLessEqual(len(state["lines"]), 40, "lines 应该截断在 40")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
