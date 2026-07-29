@@ -2,6 +2,9 @@
 
 **让 agent 在 Telegram 里发原生表格、LaTeX 公式、折叠块——以及让你在手机上看着它干活。**
 
+> <https://github.com/Circe22/tg-rich-mcp> · MIT · 只依赖 `requests`
+> 发现 bug 或者 Telegram 又更新了，欢迎开 issue / 提 PR。
+
 Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14）补齐发送侧。
 官方 telegram 插件的 `reply` 够不着这些，这个包直投 Bot API 把它接进来。
 
