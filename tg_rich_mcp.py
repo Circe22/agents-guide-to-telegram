@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""tg-rich-mcp —— 把 Telegram Bot API 的 Rich Message 接进任何 MCP host。
+"""tg-rich-mcp —— 把 Telegram Bot API 的 Rich Message 接进握手式 MCP host。
+
+（握手式＝走 initialize/initialized 那几版协议，2024-11-05 ~ 2025-11-25；
+2026-07-28 起的无状态新协议是另一套，见 README「支持哪几版 MCP 协议」。）
 
 官方 telegram 插件的 reply 只能发 text / files / 引用，够不着 Rich Message。
 这个 server 直投 Bot API，让 agent 能发：原生表格、LaTeX 公式、折叠块、

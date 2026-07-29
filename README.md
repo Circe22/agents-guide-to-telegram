@@ -15,7 +15,7 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 | `tg_rich_mcp.py` | MCP server，三个工具：发 / 原地改 / 推草稿 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
 | `secret_redaction.py` | 密钥形态的单一真源，上面两个都用它 | 跟着走，别单独删 |
-| `test_tg_rich_mcp.py` | 39 个测试，`python3 -m unittest discover -v`，0.6 秒、不发网络 | — |
+| `test_tg_rich_mcp.py` | 44 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -37,7 +37,8 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 > **TL;DR (English)** — An MCP server exposing Telegram's Rich Message API
 > (native tables, LaTeX, collapsible blocks, in-place edits, streaming drafts)
-> to any MCP host, plus a Claude Code hook that streams your agent's tool calls
+> to any handshake-based stdio MCP host (protocol 2024-11-05 … 2025-11-25),
+> plus a Claude Code hook that streams your agent's tool calls
 > into a live Telegram window. Config via `~/.tg-rich-mcp.json`.
 > Only dependency: `requests`. Redaction is on by default — `TG_PROGRESS_REDACT=0` disables it.
 >
@@ -105,8 +106,10 @@ chmod 600 ~/.tg-rich-mcp.json
 > `ping` / `logging/setLevel` 被移除。
 > （[Key Changes](https://modelcontextprotocol.io/specification/2026-07-28)）
 >
-> 好在它留了向后兼容的路：新客户端可以拿 `server/discover` 当探测，
-> 本 server 回 `method not found`，它就知道该按旧协议来。
+> 好在它留了向后兼容的路：**同时支持新旧两代协议的 stdio 客户端**，会先拿
+> `server/discover` 探测、失败再按旧握手回退——本 server 对它回 `method not found`，
+> 回退即成立（实测就是这个响应）。但**只实现了 2026-07-28 的客户端不在此列**，
+> 它连不上这个 server，这不是 bug，是两代协议的分界。
 > 真要支持新协议是另一个工程，欢迎提 PR。
 
 ### 3. 挂进度窗 hook（可选，仅 Claude Code）

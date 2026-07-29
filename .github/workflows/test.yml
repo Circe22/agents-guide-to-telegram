@@ -14,8 +14,9 @@ jobs:
         # 3.9 是 dict|None 之类语法的下限；跑一遍最新的防将来的行为变化
         python-version: ["3.9", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # v4/v5 跑在被弃用的 Node 20 上，每次 run 三条 warning；v7 系已出，顺手升掉
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install requests

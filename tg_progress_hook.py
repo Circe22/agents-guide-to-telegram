@@ -10,7 +10,7 @@
     └ 已经做了 12 步
 
 ⚠️ **这个文件是 Claude Code 专用的**（靠它的 PreToolUse hook 机制）。
-   同目录的 tg_rich_mcp.py 是通用 MCP server，任何 MCP host 都能用；
+   同目录的 tg_rich_mcp.py 是通用 MCP server，走握手式 MCP 的 host 都能用；
    这个 hook 搬不到别的 host——它们没有"工具调用前"这个钩子。
 
 挂法：写进项目或用户的 .claude/settings.json
