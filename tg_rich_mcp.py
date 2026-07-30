@@ -6,7 +6,8 @@
 
 官方 telegram 插件的 reply 只能发 text / files / 引用，够不着 Rich Message。
 这个 server 直投 Bot API，让 agent 能发：原生表格、LaTeX 公式、折叠块、
-勾选清单、引用、分割线，以及**流式草稿**（会自己变的消息）。
+勾选清单、引用、分割线、多图拼贴/轮播/地图（本地文件经 media_paths 上传，
+或用 file_id / 外链复用），以及**流式草稿**（会自己变的消息）。
 
 三个工具：
   tg_rich_send    发一条正式富消息（进聊天记录，永久保留），返回 message_id
@@ -43,7 +44,7 @@ import requests
 from secret_redaction import redact_telegram_tokens
 
 SERVER_NAME = "tg-rich"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 # 本 server 实现的是**握手式**（initialize/initialized）的 MCP，
 # 覆盖 2024-11-05 ~ 2025-11-25 这几版。
 #
@@ -149,6 +150,90 @@ def _text_error(body: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": _scrub_out(body)}], "isError": True}
 
 
+# ---------- 媒体上传 ----------
+MEDIA_MAX_BYTES = 50 * 1024 * 1024   # Bot API 上限：上传文件最大 50MB
+MEDIA_MAX_COUNT = 50                  # 官方：一条富消息最多 50 个媒体附件
+
+# 文件名形态闸：agent 拿到的是"发这个路径"，它自己不看内容——
+# 这道闸拦的是把凭证文件当图发出去的那类事故。保守设计，会误伤
+# "my_secret_santa.jpg" 这种名字，所以给了开关；报错文案会说清怎么关。
+_SENSITIVE_NAME_RE = re.compile(
+    r"^\.env($|\.)|^id_(rsa|ed25519|ecdsa|dsa)($|\.)|\.(pem|key|p12|pfx|ppk)$"
+    r"|token|credential|secret|api_?key|passwd|password|^\.netrc$|\.git-credentials$",
+    re.IGNORECASE,
+)
+
+
+def _media_guard_on() -> bool:
+    return os.environ.get("TG_RICH_MEDIA_GUARD", "1").strip() != "0"
+
+
+def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
+    """把 media_paths 读成 multipart 字典：第 i 个路径 → 附件名 f{i}。
+
+    blocks 里用 attach://f0 引用第 0 个文件，以此类推。
+    符号链接按**真实目标**检查——链接名无害不代表指向的东西无害。
+    """
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        raise ValueError("media_paths 必须是字符串数组（本地文件的绝对路径）")
+    if len(paths) > MEDIA_MAX_COUNT:
+        raise ValueError(f"一条富消息最多 {MEDIA_MAX_COUNT} 个媒体（给了 {len(paths)} 个）")
+
+    files: dict[str, tuple[str, bytes]] = {}
+    for i, raw in enumerate(paths):
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            raise ValueError(f"media_paths[{i}] 不是文件：{raw}")
+        real = path.resolve()
+        if _media_guard_on() and (
+            _SENSITIVE_NAME_RE.search(path.name) or _SENSITIVE_NAME_RE.search(real.name)
+        ):
+            raise ValueError(
+                f"media_paths[{i}] 的文件名看着像凭证（{path.name}），不发。"
+                "确认无害的话设 TG_RICH_MEDIA_GUARD=0 再试"
+            )
+        size = real.stat().st_size
+        if size > MEDIA_MAX_BYTES:
+            raise ValueError(
+                f"media_paths[{i}] 超过 Bot API 的 50MB 上限"
+                f"（{size / 1024 / 1024:.0f}MB）：{path.name}"
+            )
+        files[f"f{i}"] = (path.name, real.read_bytes())
+    return files
+
+
+def extract_file_ids(result: Any) -> list[str]:
+    """从 sendRichMessage 的响应里挖上传媒体的 file_id，按出现顺序。
+
+    photo 是尺寸变体数组（取最大那档）；video/audio 等是单对象。
+    存下 file_id 之后复用不用重新上传——photo 块的 media 直接填它。
+    ⚠️ 复用时**整串程序化取用**，别看着截断的显示手补尾巴。
+    """
+    ids: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            photo = node.get("photo")
+            if isinstance(photo, list) and photo and all(
+                isinstance(v, dict) and "file_id" in v for v in photo
+            ):
+                best = max(photo, key=lambda v: v.get("width", 0) * v.get("height", 0))
+                ids.append(str(best["file_id"]))
+            for key, value in node.items():
+                if key == "photo":
+                    continue
+                if isinstance(value, dict) and "file_id" in value:
+                    ids.append(str(value["file_id"]))
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(result)
+    return ids
+
+
 # ---------- 核心 ----------
 def build_rich(args: dict[str, Any]) -> dict[str, Any]:
     """把工具参数拼成 InputRichMessage。三选一的约束在这里守。"""
@@ -184,7 +269,11 @@ def build_rich(args: dict[str, Any]) -> dict[str, Any]:
     return rich
 
 
-def call_api(method: str, data: dict[str, Any]) -> dict[str, Any]:
+def call_api(
+    method: str,
+    data: dict[str, Any],
+    files: dict[str, tuple[str, bytes]] | None = None,
+) -> dict[str, Any]:
     token = _token()
     if not token:
         raise RuntimeError(
@@ -195,8 +284,10 @@ def call_api(method: str, data: dict[str, Any]) -> dict[str, Any]:
         response = requests.post(
             f"{TG_API}/bot{token}/{method}",
             data=data,
+            files=files or None,
             proxies=_proxies(),
-            timeout=45,
+            # 定长 multipart 走代理实测能过，但大文件要给足时间
+            timeout=180 if files else 45,
         )
         payload = response.json()
     except Exception as exc:
@@ -234,6 +325,15 @@ def _int_arg(args: dict[str, Any], key: str, what: str) -> int:
 
 def tool_send(args: dict[str, Any]) -> str:
     rich = build_rich(args)
+    media = None
+    if args.get("media_paths"):
+        if "blocks" not in rich:
+            raise ValueError(
+                "media_paths 目前只配 blocks 用：blocks 里放 photo 块、"
+                'media 填 "attach://f0" 引用第 0 个文件'
+                "（markdown/html 的媒体引用是另一套 tg://photo?id=，本工具暂未接）"
+            )
+        media = load_media(args["media_paths"])
     data: dict[str, Any] = {
         "chat_id": _resolve_chat(args),
         "rich_message": json.dumps(rich, ensure_ascii=False),
@@ -244,13 +344,23 @@ def tool_send(args: dict[str, Any]) -> str:
     if reply_to:
         data["reply_parameters"] = json.dumps({"message_id": reply_to})
 
-    payload = call_api("sendRichMessage", data)
+    payload = call_api("sendRichMessage", data, files=media)
     result = payload.get("result")
     mid = result.get("message_id") if isinstance(result, dict) else result
-    return (
+    reply = (
         f"富消息已送达（message_id: {mid}）。"
         f"想做持久进度窗就记住这个 id，之后用 tg_rich_edit 原地改它。"
     )
+    if media:
+        ids = extract_file_ids(result)
+        if ids:
+            listing = "\n".join(f"  {n}. {fid}" for n, fid in enumerate(ids, 1))
+            reply += (
+                f"\n消息里媒体的 file_id（按出现顺序）：\n{listing}\n"
+                "存下来可以复用：下次 photo 块的 media 直接填 file_id，不用再传文件。"
+                "复用时整串复制，别手打。"
+            )
+    return reply
 
 
 def tool_edit(args: dict[str, Any]) -> str:
@@ -322,7 +432,15 @@ _RECIPES = (
     '   {"type":"list","items":[{"has_checkbox":true,"is_checked":true,'
     '"blocks":[{"type":"paragraph","text":"做完了"}]}]}\n'
     "⑦ 持久进度窗（三步）：tg_rich_send 发一条 → 记住返回的 message_id → "
-    "每帧 tg_rich_edit 改它。"
+    "每帧 tg_rich_edit 改它。\n"
+    "⑧ 本地图九宫格（media_paths 配合 attach://）：\n"
+    '   media_paths=["/a/1.jpg","/a/2.jpg"] + blocks 里 '
+    '{"type":"collage","blocks":[{"type":"photo","photo":{"type":"photo","media":"attach://f0"}},'
+    '{"type":"photo","photo":{"type":"photo","media":"attach://f1"}}]}\n'
+    "   photo 的 media 还可以填 http(s) 外链或以前拿到的 file_id（复用不重传）。\n"
+    "⑨ 地图（发个坐标给对方看）：\n"
+    '   {"type":"map","location":{"latitude":63.4044,"longitude":-19.0588},'
+    '"zoom":12,"width":800,"height":500,"caption":{"text":"Reynisfjara 黑沙滩"}}'
 )
 
 
@@ -343,9 +461,13 @@ _CONTENT_SCHEMA = {
             "footer / divider / mathematical_expression(字段名是 expression，裸 LaTeX 不要包 $$) / "
             "list(items[]，支持 has_checkbox·is_checked) / blockquote(blocks[]·credit) / "
             "pullquote(text·credit) / table(cells[][]·is_bordered·is_striped·caption) / "
-            "details(summary·blocks[]·is_open) / anchor(name) / map(location·zoom·width·height) / "
-            "collage·slideshow(blocks[]·caption) / photo·video·audio·animation·voice_note / "
+            "details(summary·blocks[]·is_open) / anchor(name) / "
+            "map(location={latitude,longitude}·zoom 0-24·width·height) / "
+            "collage·slideshow(blocks[]=photo 块数组·caption={text,credit}) / "
+            "photo·video·audio·animation·voice_note / "
             "thinking(仅 draft 可用)。"
+            "媒体块的 media 三种来源：http(s) 外链 / 之前拿到的 file_id（复用不重传）/ "
+            "attach://f0（配合 media_paths 上传本地文件，第 i 个路径＝f{i}）。"
             "表格单元格：text·is_header·colspan·rowspan·align·valign。"
             "**行内样式**：任何 text 字段都可以传数组，元素是字符串或 "
             "{type, text}——type 可为 bold / italic / underline / strikethrough / code / "
@@ -378,6 +500,16 @@ TOOLS = (
                 **_CONTENT_SCHEMA,
                 "silent": {"type": "boolean", "description": "静默发送不响铃。"},
                 "reply_to": {"type": "string", "description": "引用某条 message_id。"},
+                "media_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "要上传的本地文件（绝对路径，每个≤50MB，最多 50 个）。"
+                        "只配 blocks 用：第 i 个路径在 blocks 里用 attach://f{i} 引用"
+                        "（见配方⑧）。发送成功会返回各媒体的 file_id，存下来下次直接填"
+                        " file_id 复用，不用重新上传。"
+                    ),
+                },
             },
         },
     },
@@ -433,6 +565,8 @@ INSTRUCTIONS = (
     "tg_rich_draft 只在要那种 30 秒动画质感时才用——它会消失，不是聊天手段。\n"
     "⚠️ 最容易被忽略的一点：**任何 text 字段都能传数组**，"
     "于是公式、遮挡、上下标、高亮可以嵌在句子中间，而不必单独占一块。"
+    "发本地图片用 media_paths + blocks 里 attach://f0 引用（多图就是拼贴/轮播）；"
+    "发过一次的媒体存 file_id 复用，不用重新上传。"
     "写内容前先看一眼 blocks 参数描述末尾的配方。"
 )
 

@@ -370,6 +370,120 @@ class FrameOrdering(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["msg_id"], 42)
 
 
+class MediaUpload(unittest.TestCase):
+    """media_paths → multipart。坏了＝要么发不出图，要么把凭证文件当图发出去。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def img(self, name: str, content: bytes = b"\xff\xd8fake-jpg") -> str:
+        p = self.dir / name
+        p.write_bytes(content)
+        return str(p)
+
+    def test_paths_become_attach_names_in_order(self):
+        files = mcp.load_media([self.img("a.jpg"), self.img("b.jpg")])
+        self.assertEqual(list(files), ["f0", "f1"])
+        self.assertEqual(files["f0"][0], "a.jpg")
+        self.assertEqual(files["f1"][1], b"\xff\xd8fake-jpg")
+
+    def test_files_reach_the_api_call(self):
+        captured = {}
+
+        def fake_api(method, data, files=None):
+            captured.update(method=method, files=files)
+            return {"result": {"message_id": 7}}
+
+        original, mcp.call_api = mcp.call_api, fake_api
+        os.environ["TG_CHAT_ID"] = "42"
+        try:
+            reply = call_tool("tg_rich_send", {
+                "blocks": [{"type": "photo",
+                            "photo": {"type": "photo", "media": "attach://f0"}}],
+                "media_paths": [self.img("cat.jpg")],
+            })
+        finally:
+            mcp.call_api = original
+            os.environ.pop("TG_CHAT_ID", None)
+        self.assertFalse(reply["result"].get("isError"))
+        self.assertEqual(captured["method"], "sendRichMessage")
+        self.assertIn("f0", captured["files"])
+
+    def test_media_requires_blocks(self):
+        with_markdown = call_tool("tg_rich_send", {
+            "markdown": "hi", "media_paths": [self.img("cat.jpg")]})
+        self.assertTrue(with_markdown["result"]["isError"])
+        self.assertIn("blocks", with_markdown["result"]["content"][0]["text"])
+
+    def test_missing_file_rejected(self):
+        with self.assertRaises(ValueError):
+            mcp.load_media([str(self.dir / "nope.jpg")])
+
+    def test_too_many_rejected(self):
+        paths = [self.img(f"p{i}.jpg") for i in range(3)]
+        original, mcp.MEDIA_MAX_COUNT = mcp.MEDIA_MAX_COUNT, 2
+        try:
+            with self.assertRaises(ValueError):
+                mcp.load_media(paths)
+        finally:
+            mcp.MEDIA_MAX_COUNT = original
+
+    def test_oversize_rejected(self):
+        original, mcp.MEDIA_MAX_BYTES = mcp.MEDIA_MAX_BYTES, 4
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                mcp.load_media([self.img("big.jpg", b"12345")])
+        finally:
+            mcp.MEDIA_MAX_BYTES = original
+        self.assertIn("50MB", str(ctx.exception))
+
+    def test_credential_shaped_names_blocked(self):
+        for name in [".env", ".env.production", "id_rsa", "server.pem",
+                     "my_token.png", "aws_credentials.jpg"]:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError) as ctx:
+                    mcp.load_media([self.img(name)])
+                self.assertIn("凭证", str(ctx.exception))
+
+    def test_symlink_checked_by_real_target(self):
+        """链接名无害不代表指向的东西无害。"""
+        secret = Path(self.img("server.pem"))
+        link = self.dir / "innocent.jpg"
+        link.symlink_to(secret)
+        with self.assertRaises(ValueError):
+            mcp.load_media([str(link)])
+
+    def test_guard_can_be_disabled(self):
+        """闸必须能关，而且关了要真的放行——这一条同时当变异测试：
+        证明上面的拦截真是闸干的，不是别处碰巧报错。"""
+        os.environ["TG_RICH_MEDIA_GUARD"] = "0"
+        try:
+            files = mcp.load_media([self.img(".env")])
+        finally:
+            os.environ.pop("TG_RICH_MEDIA_GUARD", None)
+        self.assertEqual(list(files), ["f0"])
+
+    def test_ordinary_photo_names_survive(self):
+        for name in ["IMG_20260730.jpg", "猫猫.png", "screenshot-1.webp"]:
+            with self.subTest(name=name):
+                self.assertEqual(list(mcp.load_media([self.img(name)])), ["f0"])
+
+    def test_file_id_extraction_prefers_biggest_variant(self):
+        result = {"rich_message": {"blocks": [
+            {"type": "collage", "blocks": [
+                {"photo": [
+                    {"file_id": "small", "width": 41, "height": 90},
+                    {"file_id": "big", "width": 581, "height": 1280},
+                ]},
+            ]},
+        ]}}
+        self.assertEqual(mcp.extract_file_ids(result), ["big"])
+
+
 class ConcurrentStateWrites(unittest.TestCase):
     """并行工具调用会同时写状态文件——无锁时后写的覆盖先写的。"""
 
