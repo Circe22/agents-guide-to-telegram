@@ -200,10 +200,11 @@ $$
 | `pullquote` | `text`, `credit?` | 居中强调引语 | ✅ |
 | `table` | `cells[][]`, `is_bordered?`, `is_striped?`, `caption?` | 原生表格 | ✅ |
 | `details` | `summary`, `blocks[]`, `is_open?` | 折叠 | ✅ |
-| `map` | `location`, `zoom`, `width`, `height`, `caption?` | 地图 | 📖 |
-| `collage` | `blocks[]`, `caption?` | 多图拼贴 | 📖 |
-| `slideshow` | `blocks[]`, `caption?` | 轮播 | 📖 |
-| `photo` `video` `animation` `audio` `voice_note` | 对应媒体 + `caption?` | 媒体块 | 📖 |
+| `map` | `location{latitude,longitude}`, `zoom` 0-24, `width`, `height`, `caption?` | 地图 | ✅ |
+| `collage` | `blocks[]`（photo 块数组）, `caption?` | 多图拼贴 | ✅ |
+| `slideshow` | `blocks[]`（photo 块数组）, `caption?` | 轮播 | ✅ |
+| `photo` | `photo`(InputMediaPhoto) + `caption?` | 图片块（外链 / file_id / attach:// 三来源全验过） | ✅ |
+| `video` `animation` `audio` `voice_note` | 对应媒体 + `caption?` | 媒体块 | 📖 |
 | `thinking` | `text` | 思考占位 | ⚠️ **只有 draft 能用** |
 
 表格单元格字段：`text?`（省略＝该格不可见）、`is_header?`、`colspan?`、`rowspan?`、
@@ -264,12 +265,21 @@ RichText 数组，所以格子里能放粗体、链接、代码、高亮。
 
 ## 4. 媒体怎么带
 
-两条路：
+三条路（blocks 路线全部实测 ✅）：
 
-1. **外部 URL**（只支持 HTTP/HTTPS）：`![](https://example.com/photo.jpg)`，
-   媒体必须**单独成块**，不能嵌在段落里。
-2. **上传/复用**：走 `InputRichMessage.media`，然后在正文里用
-   `tg://photo?id=…` / `tg://video?id=…` / `tg://audio?id=…` 引用。
+1. **外部 URL**（只支持 HTTP/HTTPS）：photo 块的 `media` 直接填链接；
+   markdown 里是 `![](https://example.com/photo.jpg)`。媒体必须**单独成块**，
+   不能嵌在段落里。
+2. **attach:// 上传本地文件**：multipart 里带文件（字段名自取，如 `f0`），
+   photo 块的 `media` 填 `attach://f0`。这就是「一条消息拼九宫格」的做法：
+   collage 的 blocks 里放 N 个 photo 块，各指一个 attach。
+3. **file_id 复用**：发送成功的响应里，每张图带一组尺寸变体（各有 file_id，
+   取面积最大那档）。存下来之后 `media` 直接填 file_id，**不用重新上传**。
+   ⚠️ file_id 必须**整串程序化取用**——它们彼此只差尾部几个字符，看着截断的
+   显示手补尾巴等于自己编标识符，命中全靠运气（真发生过，侥幸没炸）。
+
+markdown / html 路线的媒体引用是另一套：走 `InputRichMessage.media` 数组 +
+正文里 `tg://photo?id=…` / `tg://video?id=…` / `tg://audio?id=…`（📖 未实测）。
 
 上传本地文件用**定长 multipart**（`requests` 的 `files=`），别用流式——过代理容易崩。
 
@@ -331,6 +341,30 @@ RichText 数组，所以格子里能放粗体、链接、代码、高亮。
   {"type": "heading", "size": 2, "text": "风险项"}
 ]
 ```
+
+### 本地图九宫格（一条消息，不是九条）
+
+```json
+{"type": "collage",
+ "caption": {"text": "六张拼一条", "credit": "attach:// 直传"},
+ "blocks": [
+   {"type": "photo", "photo": {"type": "photo", "media": "attach://f0"}},
+   {"type": "photo", "photo": {"type": "photo", "media": "attach://f1"}}
+ ]}
+```
+
+multipart 里带 `f0`/`f1` 两个文件。`collage` 换 `slideshow` 就是左右翻页。
+配套 MCP 的话就是 `media_paths=[路径…]`，第 i 个路径＝`attach://f{i}`。
+
+### 地图（发个坐标）
+
+```json
+{"type": "map", "location": {"latitude": 63.4044, "longitude": -19.0588},
+ "zoom": 12, "width": 800, "height": 500,
+ "caption": {"text": "Reynisfjara 黑沙滩", "credit": "坐标现查，别背"}}
+```
+
+`width`/`height` 总和 ≤10000、比例 ≤20；`zoom` 0-24。
 
 ### 持久进度窗（长任务的正确姿势）
 

@@ -15,7 +15,7 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 | `tg_rich_mcp.py` | MCP server，三个工具：发 / 原地改 / 推草稿 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
 | `secret_redaction.py` | 密钥形态的单一真源，上面两个都用它 | 跟着走，别单独删 |
-| `test_tg_rich_mcp.py` | 44 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `test_tg_rich_mcp.py` | 55 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -244,6 +244,28 @@ tg_rich_edit(message_id=…, blocks=[...])   ← 每帧原地改
 ```
 
 `mathematical_expression` 的 `expression` 是**裸 LaTeX**，不要包 `$$`。
+
+### 本地图片 / 九宫格：media_paths + attach://
+
+```
+tg_rich_send(
+  media_paths=["/pics/1.jpg", "/pics/2.jpg", "/pics/3.jpg"],
+  blocks=[{"type": "collage", "blocks": [
+    {"type": "photo", "photo": {"type": "photo", "media": "attach://f0"}},
+    {"type": "photo", "photo": {"type": "photo", "media": "attach://f1"}},
+    {"type": "photo", "photo": {"type": "photo", "media": "attach://f2"}}
+  ]}]
+)
+```
+
+- 第 i 个路径＝`attach://f{i}`。`collage` 换成 `slideshow` 就是左右翻页；
+  单个 `photo` 块就是普通发图。每个文件 ≤50MB、一条消息最多 50 个。
+- 发送成功的返回里带每个媒体的 **file_id**。存下来，下次 `media` 直接填
+  file_id 复用，不用重新上传。**复用时整串程序化取用，别看着截断的显示手补
+  尾巴**——file_id 彼此长得几乎一样，手打命中纯靠运气（作者试过，侥幸没炸）。
+- 文件名形态闸：`.env` / `id_rsa` / `*.pem` / 名字含 token·credential·secret
+  之类的文件会被拒，符号链接按**真实目标**检查。会误伤 `my_secret_santa.jpg`
+  这种名字——确认无害就设 `TG_RICH_MEDIA_GUARD=0`。
 
 ### 块速查（全部实测发得出去）
 
