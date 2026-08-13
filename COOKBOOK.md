@@ -537,7 +537,50 @@ sendRichMessage  → 记住 message_id
 
 ---
 
-## 10. 官方资料
+## 10. 按钮问答：把「问用户」变成一次工具调用（相邻车道）
+
+富消息负责把内容排得好看，贴纸负责脸，**按钮负责收答案**。
+`tg_ask_choice` / `tg_ask_permission` 是 inline keyboard + `getUpdates` 长轮询的
+同步封装：发题 → 工具内部等点击 → 返回值就是 ta 选的那个。装法/布局规则/
+专用 bot 前提见 README「按钮问答」一节，这里只放配方和设计结论。
+
+### 配方 A：让 agent 出题收答案
+
+```
+tg_ask_choice(question="这道逻辑题选哪个？", options=["A", "B", "C", "D", "E"])
+→ {"index": 2, "option": "C", "message_id": 456}
+```
+
+适合的场合：对错当场判（答案在 agent 手里）、方案二选一、
+「要不要继续」的确认、菜单点单。选项超过 16 字（中文计）会自动切
+「正文列全文+编号按钮」——那是真机实测的像素剪刀线，别跟它赌。
+
+### 配方 B：在手机上审批你的 agent
+
+```bash
+claude -p "把 dist/ 清掉重新构建" \
+  --permission-prompt-tool mcp__tg-rich__tg_ask_permission
+```
+
+headless 跑的 Claude Code 一碰到要授权的调用，你的 TG 弹卡片，
+✅/❌ 一点，agent 那边立刻继续/收手。**超时＝拒绝（fail-closed）**。
+
+### 设计结论（踩过才知道的）
+
+- **同步比异步省三层楼**。自用版的选择题是异步双件套：发送工具落盘单据、
+  回流补丁监听 callback、再经 notification 唤醒一轮——因为官方插件独占着
+  getUpdates。公开版 bot 归 MCP 独用，「等答案」可以整个折进工具调用里：
+  零落盘、零补丁、零唤醒车道。**架构差异来自约束差异**，不是谁写得更好。
+- **选项文字绝不进 callback_data**（64 字节硬上限），只带
+  `ask:<nonce>:<序号>`；nonce 认单，上一题的幽灵按钮点了只会收到「过期了」。
+- **发题前先清积压**（`offset=-1` 空转一次）：上一题超时后的迟到点击，
+  不许算进这一题。
+- **收按钮是义务**：没人再轮询的键盘，点了永远转圈。所以默认选完就收
+  （`mark_answered`），超时也收。
+- **谁能点要想清楚**：私聊只认对面那个人；权限审批更狠——群聊直接拒绝发卡，
+  「谁都能点允许」的审批不是审批。
+
+## 11. 官方资料
 
 - Bot API changelog：<https://core.telegram.org/bots/api-changelog>
 - Rich Message Formatting：<https://core.telegram.org/bots/api#rich-message-formatting-options>

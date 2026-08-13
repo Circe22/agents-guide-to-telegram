@@ -14,12 +14,13 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 | 文件 | 是什么 | 通用性 |
 |---|---|---|
-| `tg_rich_mcp.py` | MCP server，五个工具：发 / 原地改 / 推草稿 / 贴纸挑发 / 贴纸入库 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
+| `tg_rich_mcp.py` | MCP server，七个工具：发 / 原地改 / 推草稿 / 贴纸挑发 / 贴纸入库 / 按钮选择题 / 手机权限审批 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
 | `tg_sticker.py` | 贴纸车道：库 / 认领 / 交集挑选 / 各 bot 懒迁移 / 句内标记（挂在上面那个 server 里） | 跟着走 |
+| `tg_ask.py` | 按钮问答机制层：inline keyboard + getUpdates 同步等点击（挂在上面那个 server 里） | 跟着走；⚠️ 要**专用 bot**，见「按钮问答要专用 bot」 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
 | `tg_sticker_hook.py` | 入站贴纸识别 hook：认识的注入标签（agent 不用看图）、不认识的提醒归档 | ⚠️ **仅 Claude Code**（UserPromptSubmit 钩子）；零网络、fail-silent |
 | `secret_redaction.py` | 密钥形态的单一真源，上面的都用它 | 跟着走，别单独删 |
-| `test_*.py` | 107 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `test_*.py` | 159 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -41,7 +42,10 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 > **TL;DR (English)** — Teach your agent to use Telegram. An MCP server exposing Telegram's Rich Message API
 > (native tables, LaTeX, collapsible blocks, in-place edits, streaming drafts,
-> plus an emoji-indexed sticker lane the agent curates itself)
+> an emoji-indexed sticker lane the agent curates itself,
+> plus synchronous button prompts: choice questions answered with one tap, and
+> phone-side permission approvals for Claude Code's `--permission-prompt-tool` —
+> timeouts fail closed)
 > to any handshake-based stdio MCP host (protocol 2024-11-05 … 2025-11-25),
 > plus a Claude Code hook that streams your agent's tool calls
 > into a live Telegram window. Config via `~/.tg-rich-mcp.json`.
@@ -342,6 +346,76 @@ tg_sticker_import(file_unique_id="…",
 本身时不会当场喷贴纸；emoji 不在库/交集为空＝原样留在正文，坏掉的时候只是
 一对普通括号，不穿帮；贴纸段发失败**不牵连已送达的文字段、也不自动重试**
 （坑 17 的纪律，话已送到、脸没送到只记一笔）。
+
+### 按钮问答：点一下就是答案（tg_ask_choice）
+
+问对方选择题，不用等 ta 打字：题干+选项变成 inline keyboard，
+**工具调用内同步等点击**，直接返回 `{"index": 1, "option": "B", "message_id": 123}`
+——不用自己接回流、不用打插件补丁、零落盘。
+
+```
+tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"])
+```
+
+布局规则（真机四组对照实测得来的）：
+
+- 选项全部 **≤16 字（中文计，拉丁/数字按半字）** → 文字直接上按钮。
+  每行几个自适应：全 ≤3 字一行 5 个（A-E 正好一排），≤8 字一行 2 个，
+  再长一行 1 个；`columns` 显式给了听你的。
+- **任何一条超线 → 整题自动切「正文列选项全文 + 1️⃣2️⃣3️⃣ 编号按钮」**。
+  为什么这么狠：超长按钮文字会被 Telegram **像素级硬剪，连省略号都不给**——
+  「先把测试跑绿然后再开始做」在按钮上会变成「先把测试跑绿然」，
+  选项含义直接残废。显式 `layout="buttons"|"numbered"` 可以按住不切。
+- 私聊只认聊天对面那个人的点击（别人点＝答 Not authorized，题继续等）；
+  群里谁点都算，先到先得。
+- 默认 `mark_answered=true`：选完原地收按钮、标上「✅ 已选」——**没人再轮询的
+  按钮是幽灵按钮**，点了永远转圈。想自己控制选完的样子就传 `false`，
+  之后用 `tg_rich_edit` 自己改。
+- 超时（默认 600s，上限 3600）明确报错返回，题留在聊天里；超时的卡片
+  同样会收按钮（`mark_answered=false` 时不收）。
+
+#### 在手机上审批你的 agent（tg_ask_permission）
+
+Claude Code 有个官方接口 `--permission-prompt-tool`：headless / 自动化跑的时候，
+权限请求交给一个 MCP 工具来决定。把它指到 `tg_ask_permission`，
+**你的手机就是权限对话框**：
+
+```bash
+claude -p "清理一下构建产物" \
+  --permission-prompt-tool mcp__tg-rich__tg_ask_permission
+```
+
+Claude 想跑需要授权的调用时，你的 TG 弹出：
+
+```
+⚙️ 权限请求
+Claude 想调用：Bash
+{
+  "command": "rm -rf dist/"
+}
+⏳ 600s 内没回应＝自动拒绝
+[✅ 允许] [❌ 拒绝]
+```
+
+点允许，那次调用照原参数放行（契约里的 `updatedInput` 原样回传）；
+点拒绝或超时，Claude 收到 deny。三条纪律：
+
+- **超时＝拒绝（fail-closed）**。没人看手机不等于同意。
+- 参数摘要**逐行过密钥闸**（复用进度窗那套 DIRTY/SECRET_SHAPES 单一真源）：
+  命中密钥形态或敏感关键词的**那一行**隐去，其余照常展示——
+  整块全遮的话，看不见参数的审批等于抛硬币。
+- **只走私聊**。群里谁都能点「允许」，那不是审批，是抽奖。
+
+#### 按钮问答要专用 bot
+
+`getUpdates` 全 Telegram **同一时刻只允许一个消费者**。你的 bot 要是同时
+挂着官方 telegram 插件、webhook、或另一个轮询进程，Telegram 回 409，
+这两个工具会带着这句话明确报错（不会傻等）。解法：去 @BotFather 给本 server
+**单独造一只 bot**，token 写进 `~/.tg-rich-mcp.json`。
+
+顺带的实话：ask 工具轮询期间会把这只 bot 的 `allowed_updates` 收窄到
+`callback_query`（Telegram 会记住这个设置）——又一个别和其他消费者
+共用 bot 的理由。
 
 ### 块速查（全部实测发得出去）
 
