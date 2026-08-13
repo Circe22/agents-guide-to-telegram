@@ -601,6 +601,12 @@ Claude 想调用：Bash
 
 ## 还没做的
 
+- **交互窗版审批卡（PreToolUse hook）**：`--permission-prompt-tool` 只管
+  non-interactive（`claude -p`）；交互窗的权限对话框归终端 UI，flag 不接管。
+  但 PreToolUse hook 在任何窗都跑：hook 里发同一张 TG 审批卡、等点击、
+  返回 `permissionDecision: allow/deny`，效果一样。机制层（`tg_ask` 的
+  发卡+轮询）可以整个复用，缺的只是一个 hook 入口脚本。
+  同样要专用 bot；超时同样必须 fail-closed（返回 deny 或 ask，别放行）。
 - **媒体 file_id 自动复用**：发过的本地文件按**内容哈希**记 file_id
   （每 bot 一份），重发同一个文件自动免上传、agent 无感。设计要点：
   上传后要把「哪个文件 → 哪个 file_id」学下来，多媒体消息的对应关系
