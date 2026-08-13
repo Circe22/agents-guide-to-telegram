@@ -349,5 +349,64 @@ class TestSplitMessage(Base):
         self.assertEqual([e["id"] for e in pool], [0])
 
 
+# ---------- 入站识别 hook ----------
+import tg_sticker_hook
+
+
+class TestHookScan(Base):
+    def setUp(self):
+        super().setUp()
+        make_library(self.dir)
+        # 模拟某个 bot 的 file_id 缓存（入站 tag 通常只有 file_id，靠它反查身份）
+        (self.dir / "file-ids.999.json").write_text(
+            json.dumps({"UNIQ1": "CACHEDFID_AAAAAAAAAAAAAAAA"}), encoding="utf-8")
+
+    @staticmethod
+    def tag(**attrs):
+        inner = " ".join(f'{k}="{v}"' for k, v in attrs.items())
+        return f'<channel source="telegram" {inner} ts="2026-08-13">'
+
+    def test_known_by_unique_id(self):
+        out = tg_sticker_hook.scan(self.tag(
+            attachment_kind="sticker",
+            attachment_file_id="F" * 24, attachment_unique_id="UNIQ2"))
+        self.assertIn("大哭猫", out)
+        self.assertIn("不用下载看图", out)
+
+    def test_known_by_file_id_reverse_map(self):
+        out = tg_sticker_hook.scan(self.tag(
+            attachment_kind="sticker", attachment_file_id="CACHEDFID_AAAAAAAAAAAAAAAA"))
+        self.assertIn("单纯生气猫", out)
+
+    def test_unknown_prompts_import(self):
+        fid = "NEWFID_" + "X" * 20
+        out = tg_sticker_hook.scan(self.tag(
+            attachment_kind="sticker", attachment_file_id=fid))
+        self.assertIn("tg_sticker_import", out)
+        self.assertIn(fid, out)
+
+    def test_template_fid_rejected(self):
+        # 回扫真库时认出的「贴纸」全是测试模板——形状闸挡这类假货
+        out = tg_sticker_hook.scan(self.tag(
+            attachment_kind="sticker", attachment_file_id="{fid}"))
+        self.assertEqual(out, "")
+
+    def test_non_sticker_attachment_ignored(self):
+        out = tg_sticker_hook.scan(self.tag(
+            attachment_kind="photo", attachment_file_id="F" * 24))
+        self.assertEqual(out, "")
+
+    def test_line_cap(self):
+        prompt = "\n".join(self.tag(
+            attachment_kind="sticker", attachment_file_id="F" * (24 + i))
+            for i in range(6))
+        self.assertEqual(len(tg_sticker_hook.scan(prompt).splitlines()),
+                         tg_sticker_hook.MAX_LINES)
+
+    def test_never_raises_on_garbage(self):
+        for garbage in ("", "<channel", "attachment_kind=\"sticker\"", "純文字"):
+            tg_sticker_hook.scan(garbage)   # 不炸即过
+
+
 if __name__ == "__main__":
     unittest.main()
