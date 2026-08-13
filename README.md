@@ -15,8 +15,9 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 | `tg_rich_mcp.py` | MCP server，五个工具：发 / 原地改 / 推草稿 / 贴纸挑发 / 贴纸入库 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
 | `tg_sticker.py` | 贴纸车道：库 / 认领 / 交集挑选 / 各 bot 懒迁移 / 句内标记（挂在上面那个 server 里） | 跟着走 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
+| `tg_sticker_hook.py` | 入站贴纸识别 hook：认识的注入标签（agent 不用看图）、不认识的提醒归档 | ⚠️ **仅 Claude Code**（UserPromptSubmit 钩子）；零网络、fail-silent |
 | `secret_redaction.py` | 密钥形态的单一真源，上面的都用它 | 跟着走，别单独删 |
-| `test_*.py` | 96 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `test_*.py` | 107 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -143,6 +144,27 @@ chmod 600 ~/.tg-rich-mcp.json
 
 前一条是每一帧，后一条是收工。只挂前一条也能用，只是窗口会停在最后一帧、不会自己收拾。
 
+### 4. 挂贴纸识别 hook（可选，仅 Claude Code）
+
+收贴纸不该靠 agent「记得」。挂上这个 hook 之后：用户发来**库里认识的**贴纸，
+agent 直接收到标题/emoji/标签/描述，不用下载看图；**没见过的**，注入一行提醒
+（file_id 已带好），得空调一次 `tg_sticker_import` 就归档。
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command",
+      "command": "python3 /绝对路径/tg_sticker_hook.py",
+      "timeout": 5}]}]
+  }
+}
+```
+
+它**零网络**（识别只查本地库，下载留给 import 工具）、fail-silent（自己挂了
+最多少一行提示，绝不挡用户说话）。前提：入站消息里有 `attachment_kind="sticker"`
+和 `attachment_file_id`（官方 telegram 插件的 tag 格式）；只有 file_id 时靠
+import 时记下的各 bot 缓存反查身份，所以**导入过的才认得出**。
+
 #### 它默认怎么干活
 
 **发一条正式消息，然后每帧原地改它**（`sendRichMessage` → `editMessageText`），
@@ -232,7 +254,8 @@ tg_rich_send(markdown="## 今日进度\n\n- [x] 修完 bug\n- [ ] 写测试")
 
 ```
 tg_rich_send(blocks=[...])        → 返回 message_id
-tg_rich_edit(message_id=…, blocks=[...])   ← 每帧原地改
+tg_rich_edit(blocks=[...])        ← 每帧原地改；message_id 可省，
+                                     默认改本会话最后发的那条（簿记归脚本）
 ```
 
 `editMessageText` 收 `rich_message`（10.1 加的），所以进度窗**不必**用 30 秒草稿：
@@ -502,6 +525,11 @@ tg_sticker_import(file_unique_id="…",
 
 ## 还没做的
 
+- **媒体 file_id 自动复用**：发过的本地文件按**内容哈希**记 file_id
+  （每 bot 一份），重发同一个文件自动免上传、agent 无感。设计要点：
+  上传后要把「哪个文件 → 哪个 file_id」学下来，多媒体消息的对应关系
+  得拿输入 blocks 的 attach 顺序对响应的媒体顺序，**数量对不齐就放弃学习**
+  ——宁可下次重传，不能学错一张图。谁要用得上，欢迎按这个写。
 - **Ephemeral Messages**（10.2）：群里只有指定用户和 bot 能看见的消息
   （`receiver_user_id`，`sendMessage` 全族都收，可编辑可删）。
   值得单独一个工具——群里给某个人发悄悄话，别人看不见。
