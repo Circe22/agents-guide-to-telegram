@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """tg_ask —— 把问题变成 Telegram 按钮，在工具调用内**同步**等答案。
 
-两个工具的机制层（注册在 tg_rich_mcp.py）：
-  tg_ask_choice      发一道选择题 → 长轮询 getUpdates 等点击 → 返回选了哪个
-  tg_ask_permission  权限审批卡：Claude Code `--permission-prompt-tool` 的
-                     手机对话框（✅允许/❌拒绝；**超时＝拒绝，fail-closed**）
+tg_ask_choice 的机制层（注册在 tg_rich_mcp.py）：
+发一道选择题 → 长轮询 getUpdates 等点击 → 返回选了哪个。
+
+（权限审批卡 tg_ask_permission 曾在这层之上实现过一版，因为我们自己
+没条件实弹验证稳定性，主动下架挂进 README「还没做的」——设计与参考
+实现见那条目。轮询核心就是本文件，谁有专用 bot 谁就能把它接回来。）
 
 前提（README「按钮问答要专用 bot」）：**bot 必须归本 server 独用**。
 getUpdates 同一时刻全 Telegram 只允许一个消费者——官方插件、webhook、
@@ -25,8 +27,6 @@ import time
 import unicodedata
 from typing import Any, Callable
 
-from secret_redaction import redact_telegram_tokens
-from tg_progress_hook import DIRTY, SECRET_SHAPES
 from tg_sticker import ApiRejected
 
 MAX_OPTIONS = 20
@@ -37,9 +37,6 @@ TEXT_LIMIT = 4096           # Bot API sendMessage 的正文上限
 POLL_SLICE = 25             # 单次 getUpdates 长轮询秒数（要小于 call_api 的 45s）
 DEFAULT_TIMEOUT = 600
 MAX_TIMEOUT = 3600
-
-ALLOW_LABEL = "✅ 允许"
-DENY_LABEL = "❌ 拒绝"
 
 CallApi = Callable[..., dict[str, Any]]
 
@@ -310,85 +307,3 @@ def tool_ask_choice(args: dict[str, Any], chat: str, call_api: CallApi) -> str:
         {"index": index, "option": option, "message_id": message_id},
         ensure_ascii=False,
     )
-
-
-# ---------- 工具：权限审批 ----------
-def _redact_line(line: str) -> str:
-    """一行一判：命中密钥关键词或密钥形态就整行隐去。
-    逐行而不是整块——审批的人得看见参数才叫审批，
-    但看不见的那一行宁可少看，不能是密钥。闸的真源在
-    tg_progress_hook（DIRTY/SECRET_SHAPES），这里只是复用，绝不另抄。"""
-    lowered = line.lower()
-    if any(word in lowered for word in DIRTY):
-        return "…（该行含敏感关键词，已隐去）"
-    if any(shape.search(line) for shape in SECRET_SHAPES):
-        return "…（该行含密钥形态，已隐去）"
-    return line
-
-
-def summarize_input(tool_input: Any, limit: int = 900) -> str:
-    """把工具参数摆给审批人看：pretty JSON、逐行过闸、超长截断。"""
-    try:
-        pretty = json.dumps(tool_input, ensure_ascii=False, indent=2)
-    except (TypeError, ValueError):
-        pretty = str(tool_input)
-    pretty = redact_telegram_tokens(pretty)
-    text = "\n".join(_redact_line(line) for line in pretty.splitlines())
-    if len(text) > limit:
-        text = text[:limit] + "\n…（截断）"
-    return text
-
-
-def tool_ask_permission(args: dict[str, Any], chat: str, call_api: CallApi) -> str:
-    """Claude Code `--permission-prompt-tool` 的契约实现。
-
-    返回值**只能**是契约 JSON 本身（allow 带 updatedInput / deny 带 message），
-    多一个字 Claude Code 就解析不了。三个出口全走 fail-closed：
-    点拒绝＝拒绝，超时＝拒绝，只有明确点了允许才放行。
-    """
-    tool_name = str(args.get("tool_name") or "").strip()
-    if not tool_name:
-        raise ValueError("tool_name 不能为空（Claude Code 会自动带上）")
-    chat = str(chat)
-    if not chat.isdigit():
-        raise ValueError(
-            "权限审批只走私聊（chat_id 得是正的用户 id）——"
-            "群里谁都能点「允许」，那不是审批是抽奖"
-        )
-    tool_input = args.get("input")
-    if isinstance(tool_input, str):
-        # host 有时把 input 序列化成字符串递进来，能解回对象就解
-        try:
-            tool_input = json.loads(tool_input)
-        except json.JSONDecodeError:
-            pass
-    timeout_s = _timeout(args)
-
-    body = (
-        f"⚙️ 权限请求\n"
-        f"Claude 想调用：{tool_name}\n\n"
-        f"{summarize_input(tool_input)}\n\n"
-        f"⏳ {timeout_s}s 内没回应＝自动拒绝"
-    )
-    nonce = secrets.token_hex(4)
-    keyboard = build_keyboard([ALLOW_LABEL, DENY_LABEL], nonce, 2)
-
-    _drain(call_api)
-    message_id = _send_card(call_api, chat, body[:TEXT_LIMIT], keyboard)
-    index = _wait_click(call_api, nonce, chat, 2, time.time() + timeout_s)
-    if index == 0:
-        _settle_card(call_api, chat, message_id, f"{body}\n\n✅ 已允许")
-        contract: dict[str, Any] = {
-            "behavior": "allow",
-            "updatedInput": tool_input if isinstance(tool_input, dict) else {},
-        }
-    elif index == 1:
-        _settle_card(call_api, chat, message_id, f"{body}\n\n❌ 已拒绝")
-        contract = {"behavior": "deny", "message": "用户在 Telegram 上点了拒绝"}
-    else:
-        _settle_card(call_api, chat, message_id, f"{body}\n\n⌛ 超时，视为拒绝")
-        contract = {
-            "behavior": "deny",
-            "message": f"{timeout_s}s 内无人审批，按拒绝处理（fail-closed）",
-        }
-    return json.dumps(contract, ensure_ascii=False)

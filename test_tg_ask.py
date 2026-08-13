@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tg_ask（按钮问答两件套）的测试。
+"""tg_ask（按钮选择题）的测试。
 
 跑：
     python3 -m unittest test_tg_ask -v
@@ -9,9 +9,7 @@
 测的是那些"坏了会伤到别人"的地方：
   · callback_data 字节预算（坏了＝Telegram 400，题发不出去）
   · owner 校验（坏了＝别人替她做决定）
-  · 权限契约（坏了＝Claude Code 解析不了 → 一切权限静默失败）
-  · 超时 fail-closed（坏了＝没人审批也放行，那还叫什么审批）
-  · 密钥闸（坏了＝把密钥推进聊天里让人"审批"它）
+  · 幽灵按钮与积压清理（坏了＝上一题的点击混进这一题）
   · 409 文案（坏了＝用户对着傻等的工具抓瞎）
 """
 from __future__ import annotations
@@ -28,8 +26,6 @@ sys.path.insert(0, str(HERE))
 import tg_ask  # noqa: E402
 import tg_rich_mcp as mcp  # noqa: E402
 from tg_sticker import ApiRejected  # noqa: E402
-
-FAKE_TOKEN = "123456789:AAH" + "x" * 32
 
 
 class FakeApi:
@@ -359,97 +355,6 @@ class ChoiceFlow(unittest.TestCase):
         self.assertNotEqual(data1, data2)
 
 
-def permission(api, **over):
-    args = {"tool_name": "Bash", "input": {"command": "ls -la"}, "timeout_s": 5}
-    args.update(over)
-    chat = over.pop("chat", "8888") if "chat" in over else "8888"
-    return json.loads(tg_ask.tool_ask_permission(args, chat, api))
-
-
-class Permission(unittest.TestCase):
-    """权限契约——错一个字段名，Claude Code 那头就是静默全拒。"""
-
-    def test_allow_contract(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(0)]])
-        result = permission(api)
-        self.assertEqual(result, {
-            "behavior": "allow", "updatedInput": {"command": "ls -la"},
-        })
-
-    def test_deny_contract(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(1)]])
-        result = permission(api)
-        self.assertEqual(result["behavior"], "deny")
-        self.assertTrue(result["message"])
-
-    def test_timeout_is_deny_not_exception(self):
-        """fail-closed 的关键一测：超时必须是**正常返回的 deny**。
-        抛异常的话 Claude Code 拿不到契约 JSON，行为就不可预期了。"""
-        api = FakeApi(plan=[[]])
-        result = permission(api, timeout_s=0)
-        self.assertEqual(result["behavior"], "deny")
-        self.assertIn("fail-closed", result["message"])
-
-    def test_group_chat_rejected(self):
-        with self.assertRaises(ValueError):
-            tg_ask.tool_ask_permission(
-                {"tool_name": "Bash", "input": {}}, "-100777", FakeApi()
-            )
-
-    def test_tool_name_required(self):
-        with self.assertRaises(ValueError):
-            tg_ask.tool_ask_permission({"input": {}}, "8888", FakeApi())
-
-    def test_card_is_two_buttons_allow_deny(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(0)]])
-        permission(api)
-        buttons = api.sent_keyboard()
-        self.assertEqual(
-            [b["text"] for b in buttons], [tg_ask.ALLOW_LABEL, tg_ask.DENY_LABEL]
-        )
-
-    def test_owner_only_even_for_permission(self):
-        """别人不能替她放行 agent。"""
-        api = FakeApi(plan=[
-            [],
-            lambda a: [a.click(0, from_id="666")],    # 陌生人点了允许
-            lambda a: [a.click(1, from_id="8888")],   # 她点拒绝
-        ])
-        result = permission(api)
-        self.assertEqual(result["behavior"], "deny")
-
-    def test_token_shape_never_reaches_the_card(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(1)]])
-        permission(api, input={
-            "command": f"curl https://api.telegram.org/bot{FAKE_TOKEN}/getMe"
-        })
-        self.assertNotIn("AAHx", api.sent_text())
-
-    def test_keyword_line_hidden(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(1)]])
-        permission(api, input={"password": "hunter2", "path": "/tmp/x"})
-        text = api.sent_text()
-        self.assertNotIn("hunter2", text)
-        self.assertIn("/tmp/x", text)   # 无害的行照常展示——看不见参数不叫审批
-
-    def test_input_as_json_string_is_parsed(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(0)]])
-        result = permission(api, input='{"a": 1}')
-        self.assertEqual(result["updatedInput"], {"a": 1})
-
-    def test_missing_input_allows_with_empty_object(self):
-        api = FakeApi(plan=[[], lambda a: [a.click(0)]])
-        args = {"tool_name": "Bash", "timeout_s": 5}
-        result = json.loads(tg_ask.tool_ask_permission(args, "8888", api))
-        self.assertEqual(result["updatedInput"], {})
-
-    def test_card_states_the_timeout_policy(self):
-        """卡片上得写明超时＝拒绝——她需要知道不点会发生什么。"""
-        api = FakeApi(plan=[[], lambda a: [a.click(0)]])
-        permission(api)
-        self.assertIn("自动拒绝", api.sent_text())
-
-
 class McpWiring(unittest.TestCase):
     """接进 server 的最后一寸：tools/list 可见、dispatch 可达。"""
 
@@ -466,8 +371,14 @@ class McpWiring(unittest.TestCase):
     def test_tools_listed(self):
         names = {t["name"] for t in mcp.TOOLS}
         self.assertIn("tg_ask_choice", names)
-        self.assertIn("tg_ask_permission", names)
         self.assertEqual(mcp.KNOWN_TOOLS, names)
+
+    def test_permission_tool_stays_offline(self):
+        """tg_ask_permission 主动下架（没实弹验证过稳定性）——
+        谁把它悄悄挂回 TOOLS，这条测试就来问设计账：先补实测，再上架。"""
+        self.assertNotIn(
+            "tg_ask_permission", {t["name"] for t in mcp.TOOLS}
+        )
 
     def test_dispatch_reaches_tg_ask(self):
         api = FakeApi(plan=[[], lambda a: [a.click(0)]])

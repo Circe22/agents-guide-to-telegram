@@ -203,7 +203,7 @@ class Protocol(unittest.TestCase):
     def test_tools_list_matches_known_tools(self):
         names = {t["name"] for t in rpc("tools/list")["result"]["tools"]}
         self.assertEqual(names, set(mcp.KNOWN_TOOLS))
-        self.assertEqual(len(names), 7)   # rich 三件 + 贴纸两件 + 按钮问答两件
+        self.assertEqual(len(names), 6)   # rich 三件 + 贴纸两件 + 按钮选择题一件
 
 
 class ToolSummaries(unittest.TestCase):

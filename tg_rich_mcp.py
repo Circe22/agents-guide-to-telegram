@@ -9,7 +9,7 @@
 勾选清单、引用、分割线、多图拼贴/轮播/地图（本地文件经 media_paths 上传，
 或用 file_id / 外链复用），以及**流式草稿**（会自己变的消息）。
 
-七个工具：
+六个工具：
   tg_rich_send        发一条正式富消息（进聊天记录，永久保留），返回 message_id；
                       markdown 正文里的（emoji）标记会剥成真贴纸（库非空时）
   tg_rich_edit        原地改一条已发出的富消息——**持久进度窗**靠它，
@@ -19,9 +19,10 @@
   tg_sticker_send     从贴纸库挑一张真贴纸直发（emoji 交集 / id / query；无参＝馆藏清单）
   tg_sticker_import   收到的贴纸下载归档→看图起标题配标签→认领入库（贴纸车道见 COOKBOOK）
   tg_ask_choice       发带按钮的选择题并**同步等答案**——对方点哪个，工具就返回哪个
-                      ⚠️ 需要专用 bot（getUpdates 独占），见 README「按钮问答要专用 bot」
-  tg_ask_permission   Claude Code `--permission-prompt-tool` 的手机审批卡
-                      （✅允许/❌拒绝，超时＝拒绝 fail-closed）
+                      ⚠️ 实验性；需要专用 bot（getUpdates 独占），见 README「按钮问答要专用 bot」
+
+（手机权限审批卡 tg_ask_permission 设计已定稿、参考实现进过一版又主动下架——
+没实弹验证过稳定性的东西不上架，详见 README「还没做的」。）
 
 配置，两个来源都行（环境变量优先）：
   ① 环境变量：TG_BOT_TOKEN（必填）/ TG_CHAT_ID（可选）/ TG_PROXY（可选）
@@ -54,7 +55,7 @@ from secret_redaction import redact_telegram_tokens
 from tg_sticker import ApiRejected
 
 SERVER_NAME = "tg-rich"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.3.1"
 # 本 server 实现的是**握手式**（initialize/initialized）的 MCP，
 # 覆盖 2024-11-05 ~ 2025-11-25 这几版。
 #
@@ -525,8 +526,6 @@ def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _text(tg_sticker.tool_sticker_import(args, _token(), call_api, download_file))
     if name == "tg_ask_choice":
         return _text(tg_ask.tool_ask_choice(args, _resolve_chat(args), call_api))
-    if name == "tg_ask_permission":
-        return _text(tg_ask.tool_ask_permission(args, _resolve_chat(args), call_api))
     raise ValueError("unknown tool")
 _RECIPES = (
     "\n\n【配方 · 直接套】\n"
@@ -744,6 +743,7 @@ TOOLS = (
             "（超长按钮会被 Telegram 像素级硬剪、连省略号都没有——真机实测）。"
             "私聊只认聊天对面那个人的点击。默认选完原地收按钮标记所选。"
             "⚠️ 需要**专用 bot**（getUpdates 独占）；等答案期间本工具阻塞，默认最多 600s。"
+            "⚠️ 实验性：轮询层目前只有单元测试背书、没跑过实弹，遇到怪事请开 issue。"
         ),
         "inputSchema": {
             "type": "object",
@@ -794,43 +794,6 @@ TOOLS = (
             "required": ["question", "options"],
         },
     },
-    {
-        "name": "tg_ask_permission",
-        "description": (
-            "**把 Claude Code 的权限对话框搬到手机上**——`--permission-prompt-tool` 的审批卡。"
-            "Claude Code 遇到需要授权的调用时自动带着 tool_name+input 来调本工具："
-            "这里发一张 TG 卡片（参数摘要逐行过密钥闸）+ ✅允许/❌拒绝两键，"
-            "返回官方权限契约 JSON。**超时＝拒绝（fail-closed）**，只有明确点允许才放行。"
-            "用法：claude -p '…' --permission-prompt-tool mcp__tg-rich__tg_ask_permission"
-            "（配方见 README「在手机上审批你的 agent」）。"
-            "只走私聊；需要专用 bot。日常问问题用 tg_ask_choice，这个是权限皮。"
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tool_name": {
-                    "type": "string",
-                    "description": "Claude Code 自动带：想调用的工具名。",
-                },
-                "input": {
-                    "type": "object",
-                    "description": (
-                        "Claude Code 自动带：那次调用的完整参数。"
-                        "点允许时原样作为 updatedInput 返回。"
-                    ),
-                },
-                "timeout_s": {
-                    "type": "integer",
-                    "description": "等多久（秒），默认 600。超时按拒绝处理。",
-                },
-                "chat_id": {
-                    "type": "string",
-                    "description": "审批卡发给谁（必须是私聊）；不给就用默认 chat_id。",
-                },
-            },
-            "required": ["tool_name"],
-        },
-    },
 )
 
 KNOWN_TOOLS = frozenset(tool["name"] for tool in TOOLS)
@@ -850,10 +813,8 @@ INSTRUCTIONS = (
     "认不出就原样留在文字里，不穿帮。想精确控制用 tg_sticker_send；"
     "收到没见过的贴纸用 tg_sticker_import 归档，看图起标题配标签后认领入库。\n"
     "要对方**点按钮回答**（选择题、二选一、要不要继续）用 tg_ask_choice——"
-    "工具同步等点击、直接返回选了哪个，不用自己盯回流；"
-    "把 Claude Code 的权限对话框搬到手机用 tg_ask_permission"
-    "（--permission-prompt-tool 指到它，超时＝拒绝）。"
-    "⚠️ 这两个要**专用 bot**：getUpdates 全 Telegram 只许一个消费者，"
+    "工具同步等点击、直接返回选了哪个，不用自己盯回流。"
+    "⚠️ 它要**专用 bot**：getUpdates 全 Telegram 只许一个消费者，"
     "bot 同时挂着官方插件/webhook 会 409。"
 )
 

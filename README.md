@@ -14,13 +14,13 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 | 文件 | 是什么 | 通用性 |
 |---|---|---|
-| `tg_rich_mcp.py` | MCP server，七个工具：发 / 原地改 / 推草稿 / 贴纸挑发 / 贴纸入库 / 按钮选择题 / 手机权限审批 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
+| `tg_rich_mcp.py` | MCP server，六个工具：发 / 原地改 / 推草稿 / 贴纸挑发 / 贴纸入库 / 按钮选择题（实验性） | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
 | `tg_sticker.py` | 贴纸车道：库 / 认领 / 交集挑选 / 各 bot 懒迁移 / 句内标记（挂在上面那个 server 里） | 跟着走 |
 | `tg_ask.py` | 按钮问答机制层：inline keyboard + getUpdates 同步等点击（挂在上面那个 server 里） | 跟着走；⚠️ 要**专用 bot**，见「按钮问答要专用 bot」 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
 | `tg_sticker_hook.py` | 入站贴纸识别 hook：认识的注入标签（agent 不用看图）、不认识的提醒归档 | ⚠️ **仅 Claude Code**（UserPromptSubmit 钩子）；零网络、fail-silent |
 | `secret_redaction.py` | 密钥形态的单一真源，上面的都用它 | 跟着走，别单独删 |
-| `test_*.py` | 159 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `test_*.py` | 148 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -43,9 +43,7 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 > **TL;DR (English)** — Teach your agent to use Telegram. An MCP server exposing Telegram's Rich Message API
 > (native tables, LaTeX, collapsible blocks, in-place edits, streaming drafts,
 > an emoji-indexed sticker lane the agent curates itself,
-> plus synchronous button prompts: choice questions answered with one tap, and
-> phone-side permission approvals for Claude Code's `--permission-prompt-tool` —
-> timeouts fail closed)
+> plus experimental synchronous choice questions answered with one button tap)
 > to any handshake-based stdio MCP host (protocol 2024-11-05 … 2025-11-25),
 > plus a Claude Code hook that streams your agent's tool calls
 > into a live Telegram window. Config via `~/.tg-rich-mcp.json`.
@@ -347,11 +345,15 @@ tg_sticker_import(file_unique_id="…",
 一对普通括号，不穿帮；贴纸段发失败**不牵连已送达的文字段、也不自动重试**
 （坑 17 的纪律，话已送到、脸没送到只记一笔）。
 
-### 按钮问答：点一下就是答案（tg_ask_choice）
+### 按钮问答：点一下就是答案（tg_ask_choice，实验性）
 
 问对方选择题，不用等 ta 打字：题干+选项变成 inline keyboard，
 **工具调用内同步等点击**，直接返回 `{"index": 1, "option": "B", "message_id": 123}`
 ——不用自己接回流、不用打插件补丁、零落盘。
+
+> ⚠️ **实验性，如实相告**：按钮的显示布局是真机实测过的，但 getUpdates
+> 轮询层目前只有单元测试背书——我们自家的 bot 被官方插件占着 getUpdates，
+> 没条件跑实弹。用得顺或撞了怪事，都请开 issue 告诉我们。
 
 ```
 tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"])
@@ -374,43 +376,11 @@ tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"]
 - 超时（默认 600s，上限 3600）明确报错返回，题留在聊天里；超时的卡片
   同样会收按钮（`mark_answered=false` 时不收）。
 
-#### 在手机上审批你的 agent（tg_ask_permission）
-
-Claude Code 有个官方接口 `--permission-prompt-tool`：headless / 自动化跑的时候，
-权限请求交给一个 MCP 工具来决定。把它指到 `tg_ask_permission`，
-**你的手机就是权限对话框**：
-
-```bash
-claude -p "清理一下构建产物" \
-  --permission-prompt-tool mcp__tg-rich__tg_ask_permission
-```
-
-Claude 想跑需要授权的调用时，你的 TG 弹出：
-
-```
-⚙️ 权限请求
-Claude 想调用：Bash
-{
-  "command": "rm -rf dist/"
-}
-⏳ 600s 内没回应＝自动拒绝
-[✅ 允许] [❌ 拒绝]
-```
-
-点允许，那次调用照原参数放行（契约里的 `updatedInput` 原样回传）；
-点拒绝或超时，Claude 收到 deny。三条纪律：
-
-- **超时＝拒绝（fail-closed）**。没人看手机不等于同意。
-- 参数摘要**逐行过密钥闸**（复用进度窗那套 DIRTY/SECRET_SHAPES 单一真源）：
-  命中密钥形态或敏感关键词的**那一行**隐去，其余照常展示——
-  整块全遮的话，看不见参数的审批等于抛硬币。
-- **只走私聊**。群里谁都能点「允许」，那不是审批，是抽奖。
-
 #### 按钮问答要专用 bot
 
 `getUpdates` 全 Telegram **同一时刻只允许一个消费者**。你的 bot 要是同时
 挂着官方 telegram 插件、webhook、或另一个轮询进程，Telegram 回 409，
-这两个工具会带着这句话明确报错（不会傻等）。解法：去 @BotFather 给本 server
+工具会带着这句话明确报错（不会傻等）。解法：去 @BotFather 给本 server
 **单独造一只 bot**，token 写进 `~/.tg-rich-mcp.json`。
 
 顺带的实话：ask 工具轮询期间会把这只 bot 的 `allowed_updates` 收窄到
@@ -601,12 +571,21 @@ Claude 想调用：Bash
 
 ## 还没做的
 
-- **交互窗版审批卡（PreToolUse hook）**：`--permission-prompt-tool` 只管
-  non-interactive（`claude -p`）；交互窗的权限对话框归终端 UI，flag 不接管。
-  但 PreToolUse hook 在任何窗都跑：hook 里发同一张 TG 审批卡、等点击、
-  返回 `permissionDecision: allow/deny`，效果一样。机制层（`tg_ask` 的
-  发卡+轮询）可以整个复用，缺的只是一个 hook 入口脚本。
-  同样要专用 bot；超时同样必须 fail-closed（返回 deny 或 ask，别放行）。
+- **手机权限审批卡 `tg_ask_permission`（设计定稿、参考实现进过一版、主动下架）**：
+  把 Claude Code 的权限对话框搬到手机——`claude -p … --permission-prompt-tool
+  mcp__tg-rich__tg_ask_permission`，TG 弹「⚙️ Claude 想调用：Bash + 参数摘要 +
+  ✅允许/❌拒绝」，返回官方权限契约 JSON。参考实现（含 12 条契约测试）在
+  git 历史 `5b0c548`，下架原因很朴素：**我们自家的 bot 被官方插件占着
+  getUpdates，这个工具我们自己一次实弹都没跑过——没验证过稳定性的东西，
+  不该顶着「能用」的样子上架**。权限决策错一次的代价比选择题高一个量级。
+  谁有专用 bot 想把它接回来，设计红线有四条，一条都别省：
+  ① **超时＝拒绝（fail-closed）**，且必须是正常返回的 deny 契约，不能抛异常
+  （抛了 Claude Code 拿不到 JSON，行为不可预期）；② 参数摘要**逐行**过密钥闸
+  （复用 `tg_progress_hook` 的 DIRTY/SECRET_SHAPES，整块全遮＝看不见参数的
+  审批等于抛硬币）；③ **只走私聊**——群里谁都能点「允许」，那不是审批是抽奖；
+  ④ 契约字段名一个都不能错（`behavior`/`updatedInput`/`message`）。
+  另有交互窗路线：flag 只管 non-interactive，交互窗走 PreToolUse hook 返回
+  `permissionDecision`，机制层同样全复用。**两条路线都等实弹验证后再上架**。
 - **媒体 file_id 自动复用**：发过的本地文件按**内容哈希**记 file_id
   （每 bot 一份），重发同一个文件自动免上传、agent 无感。设计要点：
   上传后要把「哪个文件 → 哪个 file_id」学下来，多媒体消息的对应关系
