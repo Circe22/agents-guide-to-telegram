@@ -437,6 +437,14 @@ sendRichMessage  → 记住 message_id
   ——命令的响应只对发起人可见。
   ⚠️ 官方列出的接收方法**不包含** `sendRichMessage`，别把"富消息"和"群内悄悄话"
   当成同一个接口能力。
+- **`sendDocument` / `sendPhoto`**：不包富格式的裸文件车道。上传纪律同
+  attach://（定长 multipart，别流式——「文本正常、发文件必炸」多半是流式
+  body 被代理掐）；和文字组合发送时分段记账、别整体重试，文字段可能已送达，
+  整体重试＝用户收两遍。
+- **`setMessageReaction`**：给用户的消息贴 emoji 当收讫回执（比如 👀）。
+  一条实践：**回执要带信息量**——agent 空闲时几秒内就有真回复，再贴回执是
+  噪音；改成**只在忙着干长活时**贴，用户一眼就知道「看见了，在干活，等会儿回」。
+  emoji 必须在 TG 的反应白名单里，白名单外的会被 API 拒。
 - `message_effect_id`（私聊限定的消息特效）、`protect_content`、
   `skip_entity_detection`（关掉 URL/邮箱/命令的自动识别）、
   `message_thread_id`、business connection、suggested post、付费广播参数。
