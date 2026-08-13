@@ -1,6 +1,6 @@
 # tg-rich-mcp
 
-**让 agent 在 Telegram 里发原生表格、LaTeX 公式、折叠块——以及让你在手机上看着它干活。**
+**教 agent 使用 Telegram：发原生表格、LaTeX 公式、折叠块，让你在手机上看着它干活——外加一整本真机踩出来的坑谱。**
 
 > <https://github.com/Circe22/tg-rich-mcp> · MIT · 只依赖 `requests`
 > 发现 bug 或者 Telegram 又更新了，欢迎开 issue / 提 PR。
@@ -35,7 +35,7 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 > **它默认会把长得像密钥的摘要替换成「（内容隐去）」。不喜欢这种防御？
 > `TG_PROGRESS_REDACT=0` 一把关掉** —— 详见下面「安全闸，以及怎么关」。
 
-> **TL;DR (English)** — An MCP server exposing Telegram's Rich Message API
+> **TL;DR (English)** — Teach your agent to use Telegram. An MCP server exposing Telegram's Rich Message API
 > (native tables, LaTeX, collapsible blocks, in-place edits, streaming drafts)
 > to any handshake-based stdio MCP host (protocol 2024-11-05 … 2025-11-25),
 > plus a Claude Code hook that streams your agent's tool calls
