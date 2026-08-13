@@ -9,7 +9,7 @@
 勾选清单、引用、分割线、多图拼贴/轮播/地图（本地文件经 media_paths 上传，
 或用 file_id / 外链复用），以及**流式草稿**（会自己变的消息）。
 
-五个工具：
+七个工具：
   tg_rich_send        发一条正式富消息（进聊天记录，永久保留），返回 message_id；
                       markdown 正文里的（emoji）标记会剥成真贴纸（库非空时）
   tg_rich_edit        原地改一条已发出的富消息——**持久进度窗**靠它，
@@ -18,6 +18,10 @@
                       ⚠️ 草稿活跃期间会锁死 Telegram Android 的发送框，见 README「坑」③
   tg_sticker_send     从贴纸库挑一张真贴纸直发（emoji 交集 / id / query；无参＝馆藏清单）
   tg_sticker_import   收到的贴纸下载归档→看图起标题配标签→认领入库（贴纸车道见 COOKBOOK）
+  tg_ask_choice       发带按钮的选择题并**同步等答案**——对方点哪个，工具就返回哪个
+                      ⚠️ 需要专用 bot（getUpdates 独占），见 README「按钮问答要专用 bot」
+  tg_ask_permission   Claude Code `--permission-prompt-tool` 的手机审批卡
+                      （✅允许/❌拒绝，超时＝拒绝 fail-closed）
 
 配置，两个来源都行（环境变量优先）：
   ① 环境变量：TG_BOT_TOKEN（必填）/ TG_CHAT_ID（可选）/ TG_PROXY（可选）
@@ -44,12 +48,13 @@ from typing import Any
 
 import requests
 
+import tg_ask
 import tg_sticker
 from secret_redaction import redact_telegram_tokens
 from tg_sticker import ApiRejected
 
 SERVER_NAME = "tg-rich"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 # 本 server 实现的是**握手式**（initialize/initialized）的 MCP，
 # 覆盖 2024-11-05 ~ 2025-11-25 这几版。
 #
@@ -518,6 +523,10 @@ def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _text(tg_sticker.tool_sticker_send(args, chat, _token(), call_api))
     if name == "tg_sticker_import":
         return _text(tg_sticker.tool_sticker_import(args, _token(), call_api, download_file))
+    if name == "tg_ask_choice":
+        return _text(tg_ask.tool_ask_choice(args, _resolve_chat(args), call_api))
+    if name == "tg_ask_permission":
+        return _text(tg_ask.tool_ask_permission(args, _resolve_chat(args), call_api))
     raise ValueError("unknown tool")
 _RECIPES = (
     "\n\n【配方 · 直接套】\n"
@@ -724,6 +733,104 @@ TOOLS = (
             },
         },
     },
+    {
+        "name": "tg_ask_choice",
+        "description": (
+            "发一道**带按钮的选择题**并**同步等答案**：题干+选项变成 inline keyboard，"
+            "对方点一下，工具就返回选了哪个（JSON：index / option / message_id）。"
+            "适合：A-E 的题、方案二选一、要不要继续的确认、菜单点单。"
+            "布局自动：选项全部 ≤16 字（中文计）→ 文字直接上按钮；"
+            "任何一条超线 → 整题切「正文列选项全文 + 1️⃣2️⃣3️⃣ 编号按钮」"
+            "（超长按钮会被 Telegram 像素级硬剪、连省略号都没有——真机实测）。"
+            "私聊只认聊天对面那个人的点击。默认选完原地收按钮标记所选。"
+            "⚠️ 需要**专用 bot**（getUpdates 独占）；等答案期间本工具阻塞，默认最多 600s。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "题干。按钮布局下选项文字别写进来，按钮上有。",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        f"选项文字，1~{tg_ask.MAX_OPTIONS} 个。"
+                        "返回的 option 就是这里的原文。"
+                    ),
+                },
+                "layout": {
+                    "type": "string",
+                    "enum": ["auto", "buttons", "numbered"],
+                    "description": (
+                        "留空＝auto，按 16 字线自动挑。"
+                        "buttons=文字上按钮；numbered=正文列全文+编号按钮。"
+                    ),
+                },
+                "columns": {
+                    "type": "integer",
+                    "description": (
+                        "buttons 布局每行摆几个。留空自适应：全 ≤3 字一行 5 个"
+                        "（A-E 正好一排），≤8 字一行 2 个，再长一行 1 个。"
+                    ),
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "description": "等多久（秒）。默认 600，上限 3600；超时明确报错。",
+                },
+                "mark_answered": {
+                    "type": "boolean",
+                    "description": (
+                        "默认 true：选完原地收按钮、标记所选（防幽灵按钮）。"
+                        "false=只发不改，选完那条消息变成什么样由你之后自己 edit。"
+                    ),
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "目标聊天；不给就用默认 chat_id。",
+                },
+            },
+            "required": ["question", "options"],
+        },
+    },
+    {
+        "name": "tg_ask_permission",
+        "description": (
+            "**把 Claude Code 的权限对话框搬到手机上**——`--permission-prompt-tool` 的审批卡。"
+            "Claude Code 遇到需要授权的调用时自动带着 tool_name+input 来调本工具："
+            "这里发一张 TG 卡片（参数摘要逐行过密钥闸）+ ✅允许/❌拒绝两键，"
+            "返回官方权限契约 JSON。**超时＝拒绝（fail-closed）**，只有明确点允许才放行。"
+            "用法：claude -p '…' --permission-prompt-tool mcp__tg-rich__tg_ask_permission"
+            "（配方见 README「在手机上审批你的 agent」）。"
+            "只走私聊；需要专用 bot。日常问问题用 tg_ask_choice，这个是权限皮。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "Claude Code 自动带：想调用的工具名。",
+                },
+                "input": {
+                    "type": "object",
+                    "description": (
+                        "Claude Code 自动带：那次调用的完整参数。"
+                        "点允许时原样作为 updatedInput 返回。"
+                    ),
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "description": "等多久（秒），默认 600。超时按拒绝处理。",
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "审批卡发给谁（必须是私聊）；不给就用默认 chat_id。",
+                },
+            },
+            "required": ["tool_name"],
+        },
+    },
 )
 
 KNOWN_TOOLS = frozenset(tool["name"] for tool in TOOLS)
@@ -741,7 +848,13 @@ INSTRUCTIONS = (
     "贴纸车道（库非空才生效）：tg_rich_send 的 markdown 正文里写（emoji）＝"
     "那个位置发一张库里的真贴纸——一个 emoji 随机挑、多个取交集点名；"
     "认不出就原样留在文字里，不穿帮。想精确控制用 tg_sticker_send；"
-    "收到没见过的贴纸用 tg_sticker_import 归档，看图起标题配标签后认领入库。"
+    "收到没见过的贴纸用 tg_sticker_import 归档，看图起标题配标签后认领入库。\n"
+    "要对方**点按钮回答**（选择题、二选一、要不要继续）用 tg_ask_choice——"
+    "工具同步等点击、直接返回选了哪个，不用自己盯回流；"
+    "把 Claude Code 的权限对话框搬到手机用 tg_ask_permission"
+    "（--permission-prompt-tool 指到它，超时＝拒绝）。"
+    "⚠️ 这两个要**专用 bot**：getUpdates 全 Telegram 只许一个消费者，"
+    "bot 同时挂着官方插件/webhook 会 409。"
 )
 
 
