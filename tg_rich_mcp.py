@@ -9,12 +9,15 @@
 勾选清单、引用、分割线、多图拼贴/轮播/地图（本地文件经 media_paths 上传，
 或用 file_id / 外链复用），以及**流式草稿**（会自己变的消息）。
 
-三个工具：
-  tg_rich_send    发一条正式富消息（进聊天记录，永久保留），返回 message_id
-  tg_rich_edit    原地改一条已发出的富消息——**持久进度窗**靠它，
-                  不受草稿 30 秒限制、留在聊天记录里、编辑不响铃
-  tg_rich_draft   推一帧流式草稿（30 秒临时预览，私聊限定，不进聊天记录）
-                  ⚠️ 草稿活跃期间会锁死 Telegram Android 的发送框，见 README「坑」③
+五个工具：
+  tg_rich_send        发一条正式富消息（进聊天记录，永久保留），返回 message_id；
+                      markdown 正文里的（emoji）标记会剥成真贴纸（库非空时）
+  tg_rich_edit        原地改一条已发出的富消息——**持久进度窗**靠它，
+                      不受草稿 30 秒限制、留在聊天记录里、编辑不响铃
+  tg_rich_draft       推一帧流式草稿（30 秒临时预览，私聊限定，不进聊天记录）
+                      ⚠️ 草稿活跃期间会锁死 Telegram Android 的发送框，见 README「坑」③
+  tg_sticker_send     从贴纸库挑一张真贴纸直发（emoji 交集 / id / query；无参＝馆藏清单）
+  tg_sticker_import   收到的贴纸下载归档→看图起标题配标签→认领入库（贴纸车道见 COOKBOOK）
 
 配置，两个来源都行（环境变量优先）：
   ① 环境变量：TG_BOT_TOKEN（必填）/ TG_CHAT_ID（可选）/ TG_PROXY（可选）
@@ -41,10 +44,12 @@ from typing import Any
 
 import requests
 
+import tg_sticker
 from secret_redaction import redact_telegram_tokens
+from tg_sticker import ApiRejected
 
 SERVER_NAME = "tg-rich"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 # 本 server 实现的是**握手式**（initialize/initialized）的 MCP，
 # 覆盖 2024-11-05 ~ 2025-11-25 这几版。
 #
@@ -295,8 +300,34 @@ def call_api(
             f"发送失败: {type(exc).__name__}: {_scrub(str(exc), token)}"
         ) from None
     if not payload.get("ok"):
-        raise RuntimeError(f"API 拒收: {_scrub(str(payload.get('description')), token)}")
+        # 类型化异常带 error_code：贴纸懒迁移只认 400 才算 file_id 失效，
+        # 不许拿报错文案当接口去猜。ApiRejected 继承 RuntimeError，
+        # 原有的 except 一个都不用改。
+        code = payload.get("error_code")
+        raise ApiRejected(
+            f"API 拒收: {_scrub(str(payload.get('description')), token)}",
+            int(code) if isinstance(code, int) else 0,
+        )
     return payload
+
+
+def download_file(remote_path: str) -> bytes:
+    """按 getFile 给的 file_path 把文件拉下来（贴纸归档用）。"""
+    token = _token()
+    if not token:
+        raise RuntimeError("没找到 bot token（TG_BOT_TOKEN 或配置文件 bot_token）")
+    try:
+        response = requests.get(
+            f"{TG_API}/file/bot{token}/{remote_path}",
+            proxies=_proxies(), timeout=120,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"下载失败: {type(exc).__name__}: {_scrub(str(exc), token)}"
+        ) from None
+    if response.status_code != 200:
+        raise RuntimeError(f"下载失败: HTTP {response.status_code}")
+    return response.content
 
 
 def _resolve_chat(args: dict[str, Any]) -> str:
@@ -323,7 +354,57 @@ def _int_arg(args: dict[str, Any], key: str, what: str) -> int:
         raise ValueError(f"{key} 必须是整数（{what}）") from None
 
 
+def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> str:
+    """按标记位置分段发：文字段走富消息，标记处发真贴纸。
+
+    坑 17 的纪律就落在这儿：**分段记账**。贴纸段失败不牵连已送达的文字
+    （话已经送到了，脸没送到只记一笔），整条也绝不自动重试。
+    """
+    chat = _resolve_chat(args)
+    token = _token()
+    reply_to = _int_arg(args, "reply_to", "要引用的那条消息的 message_id")
+    lines: list[str] = []
+    first = True
+    for kind, payload in parts:
+        if kind == "text":
+            if not payload:
+                continue
+            data: dict[str, Any] = {
+                "chat_id": chat,
+                "rich_message": json.dumps({"markdown": payload}, ensure_ascii=False),
+            }
+            if args.get("silent"):
+                data["disable_notification"] = "true"
+            if first and reply_to:
+                data["reply_parameters"] = json.dumps({"message_id": reply_to})
+            response = call_api("sendRichMessage", data)
+            result = response.get("result")
+            mid = result.get("message_id") if isinstance(result, dict) else result
+            lines.append(f"文字段（message_id: {mid}）")
+        else:
+            pool, combo, raw = payload
+            try:
+                entry = tg_sticker.pick(pool, combo)
+                tg_sticker.send_entry(entry, chat, token, call_api)
+                lines.append(f"贴纸「{entry.get('title')}」← 标记 {raw}")
+            except (RuntimeError, ValueError, OSError) as exc:
+                lines.append(f"贴纸未送达 ← 标记 {raw}（{exc}）")
+        first = False
+    return (
+        "已按标记位置分段送达：\n  " + "\n  ".join(lines)
+        + "\n（句内贴纸标记层可用 TG_STICKER_MARKERS=0 整体关闭）"
+    )
+
+
 def tool_send(args: dict[str, Any]) -> str:
+    # 渲染器模式的第二层：markdown 正文里的（emoji）标记剥成真贴纸，
+    # 写到哪儿贴纸跟在哪条后面（位置即语义）。库为空/标记没命中时零开销、零改动。
+    markdown_raw = str(args.get("markdown") or "")
+    if markdown_raw.strip() and not args.get("media_paths"):
+        parts = tg_sticker.split_message(markdown_raw)
+        if any(kind == "sticker" for kind, _ in parts):
+            return _send_with_stickers(parts, args)
+
     rich = build_rich(args)
     media = None
     if args.get("media_paths"):
@@ -413,6 +494,12 @@ def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _text(tool_edit(args))
     if name == "tg_rich_draft":
         return _text(tool_draft(args))
+    if name == "tg_sticker_send":
+        # 清单模式不该被「没配 chat_id」拦住——真要发的时候模块里再验
+        chat = str(args.get("chat_id") or "").strip() or _default_chat()
+        return _text(tg_sticker.tool_sticker_send(args, chat, _token(), call_api))
+    if name == "tg_sticker_import":
+        return _text(tg_sticker.tool_sticker_import(args, _token(), call_api, download_file))
     raise ValueError("unknown tool")
 _RECIPES = (
     "\n\n【配方 · 直接套】\n"
@@ -554,6 +641,69 @@ TOOLS = (
             "required": ["draft_id"],
         },
     },
+    {
+        "name": "tg_sticker_send",
+        "description": (
+            "从贴纸库挑一张**真贴纸**发进 Telegram（sendSticker 车道，"
+            "和图片的 file_id 不通用）。**不带参数＝看馆藏清单**。"
+            "emoji 挑张：一个＝那一池里随机（自动避开上次刚发的那张）；"
+            "多个＝取交集越写越窄（交集为空/不在库会明确报错，不硬找——"
+            "发错脸比不发更糟）。id 直取；query 按标题/描述/标签搜。"
+            "file_id 各 bot 独立缓存，本 bot 首次用某张时自动从归档原图上传（懒迁移）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "emoji": {
+                    "type": "string",
+                    "description": "一个或多个 emoji。多个＝取交集收窄（如两个通常就点名一张）。",
+                },
+                "id": {"type": "string", "description": "馆藏编号直取（清单里那个数字）。"},
+                "query": {"type": "string", "description": "按标题/描述/标签搜，命中里随机挑一张。"},
+                "chat_id": {
+                    "type": "string",
+                    "description": "目标聊天；不给就用默认 chat_id。",
+                },
+            },
+        },
+    },
+    {
+        "name": "tg_sticker_import",
+        "description": (
+            "把收到的贴纸收进库，之后 tg_sticker_send 和句内（emoji）标记都能用它。"
+            "给 file_id（**整串程序化取用，绝不手打**），工具会 getFile 下载原图归档，"
+            "用返回的 file_unique_id 认人（跨 bot 恒定；已在库的自动认出）。"
+            "带 title+emoji＝直接入库；不带＝先落待认领区并返回原图路径，"
+            "**用 Read 看图之后**再调一次（带 file_unique_id + title + emoji）认领——"
+            "归档自动化了，审美别自动化，标签要看着图写。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "string",
+                    "description": "入站消息里贴纸的 file_id。整串复制，别看着截断的显示手补。",
+                },
+                "file_unique_id": {
+                    "type": "string",
+                    "description": "认领待认领区条目时用（第一步的返回里给了）。",
+                },
+                "title": {"type": "string", "description": "给它起个名（看图后写）。"},
+                "emoji": {"type": "string", "description": "主情绪 emoji，清单里显示的那个。"},
+                "emojis": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "别名入口。挂得越多越容易命中——负担在库上，不在 agent 脑子里。",
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "desc": {"type": "string", "description": "一句话描述图里是什么。"},
+                "emoji_hint": {
+                    "type": "string",
+                    "description": "贴纸作者标的 emoji 线索（入站消息里有就带上，帮之后认领）。",
+                },
+            },
+        },
+    },
 )
 
 KNOWN_TOOLS = frozenset(tool["name"] for tool in TOOLS)
@@ -567,7 +717,11 @@ INSTRUCTIONS = (
     "于是公式、遮挡、上下标、高亮可以嵌在句子中间，而不必单独占一块。"
     "发本地图片用 media_paths + blocks 里 attach://f0 引用（多图就是拼贴/轮播）；"
     "发过一次的媒体存 file_id 复用，不用重新上传。"
-    "写内容前先看一眼 blocks 参数描述末尾的配方。"
+    "写内容前先看一眼 blocks 参数描述末尾的配方。\n"
+    "贴纸车道（库非空才生效）：tg_rich_send 的 markdown 正文里写（emoji）＝"
+    "那个位置发一张库里的真贴纸——一个 emoji 随机挑、多个取交集点名；"
+    "认不出就原样留在文字里，不穿帮。想精确控制用 tg_sticker_send；"
+    "收到没见过的贴纸用 tg_sticker_import 归档，看图起标题配标签后认领入库。"
 )
 
 
