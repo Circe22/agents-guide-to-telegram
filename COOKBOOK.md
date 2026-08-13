@@ -1,6 +1,6 @@
 # Telegram 富消息能玩什么 —— 能力全景与配方
 
-> 配套 `tg-rich-mcp`。Bot API **10.1**（2026-06-11）首发 Rich Messages，
+> 配套 `agents-guide-to-telegram`（前名 tg-rich-mcp）。Bot API **10.1**（2026-06-11）首发 Rich Messages，
 > **10.2**（07-14）补齐发送侧 `InputRichBlock*` / `InputRichMessage.blocks` /
 > `InputRichMessage.media` / `InputMediaVoiceNote`。
 >

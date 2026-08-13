@@ -1,9 +1,11 @@
-# tg-rich-mcp
+# The Agent's Guide to Telegram
 
 **教 agent 使用 Telegram：发原生表格、LaTeX 公式、折叠块、真贴纸，让你在手机上看着它干活——外加一整本真机踩出来的坑谱。**
 
-> <https://github.com/Circe22/tg-rich-mcp> · MIT · 只依赖 `requests`
+> <https://github.com/Circe22/agents-guide-to-telegram> · MIT · 只依赖 `requests`
 > 发现 bug 或者 Telegram 又更新了，欢迎开 issue / 提 PR。
+> （前名 `tg-rich-mcp`，旧链接与旧 git remote 均自动跳转。名字致敬你猜到的那本书——
+> 面对一个陌生星球的 API，手册比勇气有用，Don't Panic.）
 
 Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14）补齐发送侧。
 官方 telegram 插件的 `reply` 够不着这些，这个包直投 Bot API 把它接进来。
