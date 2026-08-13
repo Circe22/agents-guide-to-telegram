@@ -1,6 +1,6 @@
 # tg-rich-mcp
 
-**教 agent 使用 Telegram：发原生表格、LaTeX 公式、折叠块，让你在手机上看着它干活——外加一整本真机踩出来的坑谱。**
+**教 agent 使用 Telegram：发原生表格、LaTeX 公式、折叠块、真贴纸，让你在手机上看着它干活——外加一整本真机踩出来的坑谱。**
 
 > <https://github.com/Circe22/tg-rich-mcp> · MIT · 只依赖 `requests`
 > 发现 bug 或者 Telegram 又更新了，欢迎开 issue / 提 PR。
@@ -12,10 +12,11 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 | 文件 | 是什么 | 通用性 |
 |---|---|---|
-| `tg_rich_mcp.py` | MCP server，三个工具：发 / 原地改 / 推草稿 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
+| `tg_rich_mcp.py` | MCP server，五个工具：发 / 原地改 / 推草稿 / 贴纸挑发 / 贴纸入库 | ✅ 走**握手式** MCP 的 host（Claude Code、Claude Desktop、Cursor、自己写的 agent）——协议版本见下 |
+| `tg_sticker.py` | 贴纸车道：库 / 认领 / 交集挑选 / 各 bot 懒迁移 / 句内标记（挂在上面那个 server 里） | 跟着走 |
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
-| `secret_redaction.py` | 密钥形态的单一真源，上面两个都用它 | 跟着走，别单独删 |
-| `test_tg_rich_mcp.py` | 55 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `secret_redaction.py` | 密钥形态的单一真源，上面的都用它 | 跟着走，别单独删 |
+| `test_*.py` | 96 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -36,7 +37,8 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 > `TG_PROGRESS_REDACT=0` 一把关掉** —— 详见下面「安全闸，以及怎么关」。
 
 > **TL;DR (English)** — Teach your agent to use Telegram. An MCP server exposing Telegram's Rich Message API
-> (native tables, LaTeX, collapsible blocks, in-place edits, streaming drafts)
+> (native tables, LaTeX, collapsible blocks, in-place edits, streaming drafts,
+> plus an emoji-indexed sticker lane the agent curates itself)
 > to any handshake-based stdio MCP host (protocol 2024-11-05 … 2025-11-25),
 > plus a Claude Code hook that streams your agent's tool calls
 > into a live Telegram window. Config via `~/.tg-rich-mcp.json`.
@@ -282,6 +284,40 @@ tg_rich_send(
   之类的文件会被拒，符号链接按**真实目标**检查。会误伤 `my_secret_santa.jpg`
   这种名字——确认无害就设 `TG_RICH_MEDIA_GUARD=0`。
 
+### 贴纸：agent 的脸（两层）
+
+思路、身份三定律和判断标准见 [COOKBOOK「贴纸」一章](COOKBOOK.md)；这里只讲用法。
+库默认在 `~/.tg-rich-mcp-stickers/`（`TG_STICKER_DIR` 或配置文件 `sticker_dir`
+可改），**空库时两层都零开销、零打扰**。
+
+**第一层：工具对。**
+
+```
+tg_sticker_send()                            ← 不带参数＝看馆藏清单
+tg_sticker_send(emoji="😾")                  ← 那一池里随机（避开上次刚发的那张）
+tg_sticker_send(emoji="💻😾")                ← 交集收窄，通常两个 emoji 就点名一张
+tg_sticker_import(file_id="…")               ← getFile 下载归档 → 返回原图路径，看图后……
+tg_sticker_import(file_unique_id="…",
+                  title="…", emoji="…")      ← ……再来认领入库（emojis 别名越多越容易命中）
+```
+
+**第二层：句内标记，渲染器模式的顺风车。** `tg_rich_send` 的 markdown 正文里
+写 `（emoji）`，那个位置就发一张库里的真贴纸——写到哪儿，脸跟在哪条后面
+（位置即语义）。已经按「渲染器模式」把正式回复路由过来的 agent，什么都不用改
+就有了这层。
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `TG_STICKER_MARKERS` | 开 | `=0` 关掉句内标记层（工具对不受影响） |
+| `TG_STICKER_MAX` | 3 | 一条消息最多剥几张，多出来的原样留在正文 |
+| `TG_STICKER_DIR` | `~/.tg-rich-mcp-stickers` | 库目录 |
+
+标记层的保守取舍（自用版实跑出来的，别轻易放宽）：括号里出现字母/数字/汉字/
+空白＝普通括号话，一律不碰（`（挑眉）`安全）；反引号里不算数——讨论这套语法
+本身时不会当场喷贴纸；emoji 不在库/交集为空＝原样留在正文，坏掉的时候只是
+一对普通括号，不穿帮；贴纸段发失败**不牵连已送达的文字段、也不自动重试**
+（坑 17 的纪律，话已送到、脸没送到只记一笔）。
+
 ### 块速查（全部实测发得出去）
 
 **块级**
@@ -466,14 +502,6 @@ tg_rich_send(
 
 ## 还没做的
 
-- **贴纸车道（两层）**——思路和坑已写在 [COOKBOOK「贴纸」一章](COOKBOOK.md)：
-  - 第一层，工具对：`sticker_import`（收到新贴纸，agent 自己下载归档、看图配
-    emoji 标签）+ `sticker_send`（按 emoji 交集挑张直发，file_id 各 bot 懒缓存）。
-  - 第二层，句内标记：出站文字里的 `（emoji）` 直接在发送工具里剥成真贴纸，
-    写到哪儿贴纸跟在哪条后面（位置即语义）。和「渲染器模式」是同一条出口：
-    把正式回复路由过这个 MCP 的 agent，顺带就获得句内贴纸——不用 patch 任何插件。
-    自用版的实测结论：工具层是地基，**标记层才是让 agent 真的常用贴纸的那层**
-    ——调工具是个「决定」，句内标记是「反射」。
 - **Ephemeral Messages**（10.2）：群里只有指定用户和 bot 能看见的消息
   （`receiver_user_id`，`sendMessage` 全族都收，可编辑可删）。
   值得单独一个工具——群里给某个人发悄悄话，别人看不见。
