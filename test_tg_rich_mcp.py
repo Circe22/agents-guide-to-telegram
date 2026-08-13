@@ -136,6 +136,8 @@ class ErrorClassification(unittest.TestCase):
         self.assertIn("三选一", reply["result"]["content"][0]["text"])
 
     def test_missing_message_id_is_tool_error(self):
+        # 本会话没发过任何消息时，缺 id 必须还是错误（edit-last 只在发过之后接管）
+        mcp._LAST_SENT.clear()
         reply = call_tool("tg_rich_edit", {"markdown": "x"})
         self.assertTrue(reply["result"]["isError"])
 
@@ -291,6 +293,56 @@ class ProgressBlocks(unittest.TestCase):
         evil = hook._state_path("../../../../tmp/pwned")
         self.assertEqual(evil.parent, hook.STATE_DIR)
         self.assertNotIn("..", str(evil))
+
+
+class EditLast(unittest.TestCase):
+    """edit 不带 message_id 默认改本会话最后发的那条——簿记归脚本。"""
+
+    def setUp(self):
+        self.calls = []
+        self.original = mcp.call_api
+
+        def fake(method, data, files=None):
+            self.calls.append((method, dict(data)))
+            return {"result": {"message_id": 88}}
+
+        mcp.call_api = fake
+        self.had_chat = os.environ.get("TG_CHAT_ID")
+        os.environ["TG_CHAT_ID"] = "-100777"
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["TG_STICKER_DIR"] = self.tmp.name   # 空库＝标记层不掺和
+        mcp._LAST_SENT.clear()
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        if self.had_chat is None:
+            os.environ.pop("TG_CHAT_ID", None)
+        else:
+            os.environ["TG_CHAT_ID"] = self.had_chat
+        os.environ.pop("TG_STICKER_DIR", None)
+        mcp._LAST_SENT.clear()
+        self.tmp.cleanup()
+
+    def test_edit_without_id_targets_last_sent(self):
+        mcp.tool_send({"markdown": "第一帧"})
+        out = mcp.tool_edit({"markdown": "第二帧"})
+        self.assertEqual(self.calls[-1][0], "editMessageText")
+        self.assertEqual(self.calls[-1][1]["message_id"], 88)
+        self.assertIn("88", out)
+
+    def test_edit_without_id_before_any_send_errors(self):
+        with self.assertRaises(ValueError):
+            mcp.tool_edit({"markdown": "x"})
+
+    def test_explicit_id_wins_over_last_sent(self):
+        mcp.tool_send({"markdown": "hi"})
+        mcp.tool_edit({"markdown": "y", "message_id": "5"})
+        self.assertEqual(self.calls[-1][1]["message_id"], 5)
+
+    def test_last_sent_is_per_chat(self):
+        mcp.tool_send({"markdown": "给默认 chat"})
+        with self.assertRaises(ValueError):
+            mcp.tool_edit({"markdown": "x", "chat_id": "另一个聊天"})
 
 
 class FrameOrdering(unittest.TestCase):

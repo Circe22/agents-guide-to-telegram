@@ -240,6 +240,12 @@ def extract_file_ids(result: Any) -> list[str]:
 
 
 # ---------- 核心 ----------
+# 本会话每个 chat 最后一条「可原地编辑」的消息（贴纸不算——贴纸没有 editMessageText）。
+# 给 tg_rich_edit 的簿记减负：进度窗循环里 agent 不用自己记 message_id。
+# 只活在进程内存里，重启即忘——比落盘更诚实：跨会话去改一条旧消息才是事故。
+_LAST_SENT: dict[str, int] = {}
+
+
 def build_rich(args: dict[str, Any]) -> dict[str, Any]:
     """把工具参数拼成 InputRichMessage。三选一的约束在这里守。"""
     markdown = str(args.get("markdown") or "").strip()
@@ -380,6 +386,8 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
             response = call_api("sendRichMessage", data)
             result = response.get("result")
             mid = result.get("message_id") if isinstance(result, dict) else result
+            if isinstance(mid, int):
+                _LAST_SENT[chat] = mid
             lines.append(f"文字段（message_id: {mid}）")
         else:
             pool, combo, raw = payload
@@ -428,6 +436,8 @@ def tool_send(args: dict[str, Any]) -> str:
     payload = call_api("sendRichMessage", data, files=media)
     result = payload.get("result")
     mid = result.get("message_id") if isinstance(result, dict) else result
+    if isinstance(mid, int):
+        _LAST_SENT[data["chat_id"]] = mid
     reply = (
         f"富消息已送达（message_id: {mid}）。"
         f"想做持久进度窗就记住这个 id，之后用 tg_rich_edit 原地改它。"
@@ -450,12 +460,20 @@ def tool_edit(args: dict[str, Any]) -> str:
     这是**持久进度窗**的做法：开工先 tg_rich_send 发一条，记住 message_id，
     之后每帧 edit 它——不受草稿 30 秒的限制、留在聊天记录里、编辑不响铃。
     """
+    chat = _resolve_chat(args)
     message_id = _int_arg(args, "message_id", "tg_rich_send 返回的那个 id")
     if not message_id:
-        raise ValueError("要改哪条？给 message_id（tg_rich_send 的返回里有）")
+        # 簿记归脚本：不带 id 就改本会话最后发的那条。跨会话不记——
+        # 重启后凭记忆去改一条旧消息，比报错要求给 id 危险得多。
+        message_id = _LAST_SENT.get(chat, 0)
+        if not message_id:
+            raise ValueError(
+                "要改哪条？给 message_id，或先用 tg_rich_send 发一条"
+                "（本会话发过之后，不带 id 默认改最后那条）"
+            )
     rich = build_rich(args)
     call_api("editMessageText", {
-        "chat_id": _resolve_chat(args),
+        "chat_id": chat,
         "message_id": message_id,
         "rich_message": json.dumps(rich, ensure_ascii=False),
     })
@@ -614,10 +632,12 @@ TOOLS = (
                 **_CONTENT_SCHEMA,
                 "message_id": {
                     "type": "integer",
-                    "description": "要改哪条——tg_rich_send 的返回里给了这个 id。",
+                    "description": (
+                        "要改哪条——tg_rich_send 的返回里给了这个 id。"
+                        "**可省略**：不给就改本会话最后发的那条（进度窗循环不用记 id）。"
+                    ),
                 },
             },
-            "required": ["message_id"],
         },
     },
     {
