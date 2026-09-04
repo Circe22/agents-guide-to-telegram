@@ -20,7 +20,8 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 | `tg_progress_hook.py` | 进度窗 hook：每次调工具前推一行 | ⚠️ **仅 Claude Code**（靠它的 PreToolUse 钩子，别的 host 没有这个机制），且需要 Linux / macOS / WSL |
 | `tg_sticker_hook.py` | 入站贴纸识别 hook：认识的注入标签（agent 不用看图）、不认识的提醒归档 | ⚠️ **仅 Claude Code**（UserPromptSubmit 钩子）；零网络、fail-silent |
 | `secret_redaction.py` | 密钥形态的单一真源，上面的都用它 | 跟着走，别单独删 |
-| `test_*.py` | 148 个测试，`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `sticker-spec/` | 贴纸标记语法的规格真源：共享 golden fixtures，多实现各自跑同一份止漂移（见 COOKBOOK 贴纸章末节） | ✅ 任何实现这套标记语法的都该跑 |
+| `test_*.py` | 169 个测试（含 `test_conformance.py` 跑 sticker-spec），`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
