@@ -651,5 +651,53 @@ class OrphanStickerGuard(unittest.TestCase):
         self.assertIn('"message_id": 42', data.get("reply_parameters", ""))
 
 
+class DraftCanStop(unittest.TestCase):
+    """can_stop / keep_on_stop 透传：开了才带，没开一个字节都不多发。"""
+
+    def setUp(self):
+        self.calls = []
+        self.original = mcp.call_api
+        mcp.call_api = lambda method, data, files=None: (
+            self.calls.append((method, dict(data))), {"result": {}})[1]
+        self.had = os.environ.get("TG_CHAT_ID")
+        os.environ["TG_CHAT_ID"] = "888"
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["TG_STICKER_DIR"] = self.tmp.name   # 空库＝标记层不掺和
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        if self.had is None:
+            os.environ.pop("TG_CHAT_ID", None)
+        else:
+            os.environ["TG_CHAT_ID"] = self.had
+        os.environ.pop("TG_STICKER_DIR", None)
+        self.tmp.cleanup()
+
+    def test_default_sends_neither(self):
+        mcp.tool_draft({"markdown": "x", "draft_id": 1})
+        _, data = self.calls[0]
+        self.assertNotIn("can_stop", data)
+        self.assertNotIn("keep_on_stop", data)
+
+    def test_can_stop_passes_through(self):
+        mcp.tool_draft({"markdown": "x", "draft_id": 1, "can_stop": True})
+        _, data = self.calls[0]
+        self.assertEqual(data.get("can_stop"), "true")
+        self.assertNotIn("keep_on_stop", data)
+
+    def test_keep_on_stop_requires_can_stop(self):
+        # 单给 keep_on_stop 不带 can_stop ＝ 没有按钮可按，参数不该出门
+        mcp.tool_draft({"markdown": "x", "draft_id": 1, "keep_on_stop": True})
+        _, data = self.calls[0]
+        self.assertNotIn("keep_on_stop", data)
+
+    def test_both_pass_through(self):
+        mcp.tool_draft({"markdown": "x", "draft_id": 1,
+                        "can_stop": True, "keep_on_stop": True})
+        _, data = self.calls[0]
+        self.assertEqual(data.get("can_stop"), "true")
+        self.assertEqual(data.get("keep_on_stop"), "true")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

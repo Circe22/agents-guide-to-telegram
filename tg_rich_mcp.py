@@ -519,11 +519,20 @@ def tool_draft(args: dict[str, Any]) -> str:
         # 群/频道 id 以 - 开头。与其等 API 拒收，不如当场说清楚
         raise ValueError("草稿只能发私聊；群里要实时进度请用 tg_rich_send + tg_rich_edit")
     rich = build_rich(args)
-    call_api("sendRichMessageDraft", {
+    data: dict[str, Any] = {
         "chat_id": chat,
         "draft_id": draft_id,
         "rich_message": json.dumps(rich, ensure_ascii=False),
-    })
+    }
+    # can_stop（Bot API 10.3）：给用户一颗停止按钮，解锁被流式占住的输入框。
+    # ⚠️ 只开按钮不接事件＝半套：用户按停后服务端**照收**后续帧（2026-09-04
+    # Android 实测），bot 不监听 stopped_message_generation 就会瞎推到底。
+    # 本 server 走 stdio、不碰 getUpdates，接事件是收信侧（频道插件/webhook）的活。
+    if args.get("can_stop"):
+        data["can_stop"] = "true"
+        if args.get("keep_on_stop"):
+            data["keep_on_stop"] = "true"
+    call_api("sendRichMessageDraft", data)
     return (
         f"草稿已推（draft_id={draft_id}）。它只活 30 秒、不进聊天记录——"
         "内容定稿后必须再调一次 tg_rich_send 才留得住。"
@@ -688,6 +697,17 @@ TOOLS = (
                 "draft_id": {
                     "type": "integer",
                     "description": "非零整数。同一个 id 连续调用＝同一个窗口在变。",
+                },
+                "can_stop": {
+                    "type": "boolean",
+                    "description": "给用户一颗停止按钮（Bot API 10.3+，客户端也要够新）。"
+                                   "⚠️ 用户按停后本 server 收不到通知（stop 事件走收信侧），"
+                                   "且服务端照收后续帧——接不了事件就别把停止按钮当承诺。",
+                },
+                "keep_on_stop": {
+                    "type": "boolean",
+                    "description": "按停后草稿暂留聊天里（仍会很快消失；要真留住得把"
+                                   "半成品用 tg_rich_send 补发成正式消息）。需 can_stop。",
                 },
             },
             "required": ["draft_id"],
