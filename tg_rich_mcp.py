@@ -55,7 +55,7 @@ from secret_redaction import redact_telegram_tokens
 from tg_sticker import ApiRejected
 
 SERVER_NAME = "tg-rich"
-SERVER_VERSION = "1.3.1"
+SERVER_VERSION = "1.4.0"
 # 本 server 实现的是**握手式**（initialize/initialized）的 MCP，
 # 覆盖 2024-11-05 ~ 2025-11-25 这几版。
 #
