@@ -27,14 +27,16 @@
 
   * **edit（默认·持久窗）**：开工发一条正式富消息，之后每帧 `editMessageText`
     原地改它。不受草稿 30 秒寿命限制、留在聊天记录里、编辑不响铃。
-  * **draft（流式草稿）**：`sendRichMessageDraft` 逐帧动画，好看。
+  * **draft（流式草稿）**：`sendRichMessageDraft` 逐帧动画，好看，
+    **收工自动消失**（草稿不进聊天记录，正好是进度窗想要的结局）。
     ⚠️ **安卓代价**：草稿活跃期间 Telegram Android 把发送键换成省略号，
     用户发不出消息，**且这期间在输入框里打的字会在恢复时被清空**。
-    官方记录 <https://bugs.telegram.org/c/62189>，Telegram 已关闭该 issue
-    并称是"当前预期行为"——所以这不是等一个修复就能好的事。
-    长任务里用户最需要插话的时刻（补条件、喊停、纠方向）恰好是草稿最活跃的时刻，
-    所以默认不走这条路；桌面端据用户反馈不锁输入框（用户反馈，不是官方的跨平台
-    保证），想要动画质感的自己打开。
+    官方记录 <https://bugs.telegram.org/c/62189> 被关闭称"预期行为"；
+    Bot API 10.3 起本 hook 的每帧都带 `can_stop`——**新客户端**有停止按钮，
+    按停＝草稿消失+输入框解锁，后续帧被客户端扔掉（2026-09-04 Android 实测）。
+    但旧客户端**不画这颗按钮**、锁死照旧，且 hook 收不到 stop 事件（它走收信侧）。
+    你没法预知用户拿的是哪版客户端 ⇒ 默认仍不走这条路，想要动画质感的自己打开。
+    桌面端据用户反馈不锁输入框（用户反馈，不是官方的跨平台保证）。
 
 收工怎么处置（`TG_PROGRESS_END`，默认 `delete`）：干完活把那扇窗**撤掉**，
 聊天记录里一条工具调用都不留。`keep` 则定格成终态留档。删不掉（超 48 小时 /
@@ -323,6 +325,10 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
             tool_draft({
                 "draft_id": int(state.get("draft_id") or 0),
                 "blocks": _blocks(lines, total, draft=True),
+                # 新客户端由此得到停止按钮（按停＝解锁输入框）；旧客户端无感。
+                # hook 收不到 stop 事件——按停后这儿会继续瞎推，但客户端会把
+                # 已停 draft_id 的后续帧直接扔掉，无害。
+                "can_stop": True,
             })
             return 0
 
@@ -377,7 +383,10 @@ def _finish() -> int:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         message_id = int(state.get("msg_id") or 0)
         chat = _default_chat()
-        if message_id and chat and _mode() == "edit":
+        # 只认 msg_id 不认当前模式：用户 edit 跑了半截、重启改成 draft 时，
+        # 账上挂着的持久窗照样要收掉，否则它成孤儿永远留在聊天里。
+        # 纯 draft 轮 msg_id=0，这儿天然短路。
+        if message_id and chat:
             gone = False
             if _end_mode() == "delete":
                 try:
