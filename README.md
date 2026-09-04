@@ -52,9 +52,13 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 > ⚠️ **Android caveat**: while a streaming draft is active, Telegram Android replaces the
 > user's send button with an ellipsis — they cannot send anything, and text already typed
 > gets wiped when the input recovers ([bugs.telegram.org/c/62189](https://bugs.telegram.org/c/62189),
-> closed by Telegram as expected behaviour). The progress hook therefore defaults to
-> `sendRichMessage` + `editMessageText` and deletes the window when done;
-> drafts are opt-in via `TG_PROGRESS_MODE=draft`.
+> closed by Telegram as expected behaviour). Bot API 10.3 added a partial fix: drafts sent
+> with `can_stop` show a Stop button on **up-to-date** clients — pressing it dismisses the
+> draft and unlocks the composer — but the bot can't hear the press unless its inbound side
+> handles `stopped_message_generation`, and older clients never draw the button.
+> The progress hook therefore still defaults to `sendRichMessage` + `editMessageText`
+> and deletes the window when done; drafts (frames sent with `can_stop`) are opt-in
+> via `TG_PROGRESS_MODE=draft`.
 
 ---
 
@@ -177,18 +181,23 @@ import 时记下的各 bot 缓存反查身份，所以**导入过的才认得出
 > ⚠️ **为什么默认不是流式草稿**：`sendRichMessageDraft` 活跃期间，
 > **Telegram Android 会把用户的发送键换成省略号，用户发不出消息，
 > 而且这期间在输入框里打的字会在恢复时被清空。**
-> 官方缺陷记录 <https://bugs.telegram.org/c/62189> 已被关闭，称是"当前预期行为"
-> ——不是等一个修复就能好的事。
+> 官方缺陷记录 <https://bugs.telegram.org/c/62189> 已被关闭，称是"当前预期行为"。
+> Bot API 10.3 起本 hook 的草稿帧都带 `can_stop`——**新客户端**有停止按钮，
+> 按停＝草稿消失+输入框解锁（2026-09-04 Android 实测）。但发布出去的 hook
+> 没法预知用户拿的是哪版客户端：**旧客户端不画这颗按钮**、锁死照旧；
+> 且 hook 收不到按停事件（`stopped_message_generation` 走收信侧）——
+> 好在进度窗瞎推无害，按停后客户端会把同 draft_id 的后续帧直接扔掉。
 >
 > 长任务里用户最需要插话的时刻（补条件、喊停、纠方向、回答 agent 的提问），
-> 恰好就是草稿最活跃的时刻。所以草稿只在你显式打开时才走。
+> 恰好就是草稿最活跃的时刻。所以草稿仍只在你显式打开时才走——
+> 确认你的用户客户端够新（或在桌面端）再开。
 > 桌面端据用户反馈不锁输入框——那是**用户反馈，不是官方的跨平台保证**。
 
 | 想要什么 | 怎么设 |
 |---|---|
 | 默认（持久窗 + 收工撤掉） | 什么都不用设 |
 | 干完把窗口留下来当记录 | `TG_PROGRESS_END=keep` |
-| 就要那种流式动画（**接受安卓锁输入框**） | `TG_PROGRESS_MODE=draft` |
+| 就要那种流式动画+自动蒸发（帧自带 can_stop；**旧客户端仍锁输入框**） | `TG_PROGRESS_MODE=draft` |
 | 换标题 | `TG_PROGRESS_TITLE=…` / `TG_PROGRESS_DONE_TITLE=…` |
 
 **不用改 bot、不用升级什么**——Rich Message 是 Telegram 服务端的能力，
