@@ -39,12 +39,36 @@ _RI_LO, _RI_HI = "\U0001F1E6", "\U0001F1FF"   # regional indicator（旗帜的�
 class ApiRejected(RuntimeError):
     """Telegram API 明确拒收（payload.ok == false）。
 
-    `code` 是 error_code。挑「file_id 失效」只认 400——别拿报错文案当接口。
+    `code` 是 error_code。挑「file_id 失效」**先**认 400（网络错/限流/5xx
+    一律不算），400 之内再用 `_looks_file_id_400` 收窄——因为 400 是个杂物袋，
+    chat 不存在、参数错也报 400，那些跟 file_id 半点关系没有（澄 2026-09-04
+    审出：generic 400 全当 ID 失效会白传一遍归档、还把真错因盖掉）。
     """
 
     def __init__(self, description: str, code: int = 0) -> None:
         super().__init__(description)
         self.code = code
+
+
+# 400 之内点名「这真是 file_id 的事」的文案信号（全小写比对）。
+# 与「别拿报错文案当接口」的老规矩不冲突——错误码仍是主闸（非 400 永不重传），
+# 文案只在 400 内部做**放行名单**：认得出的才重传，认不出的原样抛出去
+# （fail-loud——宁可用户看见真错误，也不做一次白费的上传去盖住它）。
+# Telegram 出了新的 file_id 失效文案导致这儿漏放行时，把那句加进来即可。
+_FILE_ID_400_SIGNS = (
+    "file id",           # "wrong file identifier/HTTP URL specified" 也含这段
+    "file_id",
+    "file reference",
+    "file_reference",    # FILE_REFERENCE_EXPIRED 这类下划线体
+    "remote file",       # "wrong remote file identifier specified"
+)
+
+
+def _looks_file_id_400(exc: ApiRejected) -> bool:
+    if exc.code != 400:
+        return False
+    text = str(exc).lower()
+    return any(sign in text for sign in _FILE_ID_400_SIGNS)
 
 
 # ---------- emoji 处理 ----------
@@ -237,9 +261,9 @@ def send_entry(entry: dict[str, Any], chat_id: str, token: str,
             api("sendSticker", {"chat_id": chat_id, "sticker": cached})
             return f"贴纸已发：{entry.get('title')}（{entry.get('emoji')}）"
         except ApiRejected as exc:
-            if exc.code != 400:
-                raise
-            # 400 ＝ 这个 file_id 对本 bot 失效（换过 token 等），走重传
+            if not _looks_file_id_400(exc):
+                raise      # 非 400，或 400 但不关 file_id 的事（chat 错/参数错）
+            # 文案点名 file_id 失效（换过 token 等），才走归档重传
     real = _archive_file(entry)
     payload = api("sendSticker", {"chat_id": chat_id},
                   files={"sticker": (real.name, real.read_bytes())})

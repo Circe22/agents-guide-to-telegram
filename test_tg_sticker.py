@@ -191,6 +191,35 @@ class TestSendEntry(Base):
             tg_sticker.send_entry(self.entries[0], "111", TOKEN, api)
         self.assertEqual(len(api.calls), 1)
 
+    def test_unrelated_400_is_not_id_invalidation(self):
+        """澄审 P2-3 点名的反例：400 是杂物袋，chat 错也报 400。
+
+        cached file_id 本身没问题、错在别处时：不许触发归档重传（白传一遍
+        还把真错因盖掉）、不许动缓存、异常原样出去让调用方看到真错误。
+        """
+        tg_sticker.remember_file_id(TOKEN, "UNIQ0", "GOOD")
+        for desc in ["Bad Request: chat not found",
+                     "Bad Request: PEER_ID_INVALID",
+                     "Bad Request: message text is empty"]:
+            with self.subTest(desc=desc):
+                api = FakeApi(fails=[ApiRejected(desc, 400)])
+                with self.assertRaises(ApiRejected):
+                    tg_sticker.send_entry(self.entries[0], "111", TOKEN, api)
+                self.assertEqual(len(api.calls), 1, "无关 400 不许触发重传")
+                self.assertEqual(tg_sticker.load_cache(TOKEN)["UNIQ0"], "GOOD")
+
+    def test_real_file_id_400_wordings_all_reupload(self):
+        # 官方真实文案逐句过放行名单——名单改坏任何一句都得转红
+        for desc in ["Bad Request: wrong file identifier/HTTP URL specified",
+                     "Bad Request: wrong remote file identifier specified: xxx",
+                     "Bad Request: FILE_REFERENCE_EXPIRED"]:
+            with self.subTest(desc=desc):
+                tg_sticker.remember_file_id(TOKEN, "UNIQ0", "STALE")
+                api = FakeApi(fails=[ApiRejected(desc, 400), None])
+                tg_sticker.send_entry(self.entries[0], "111", TOKEN, api)
+                self.assertEqual(len(api.calls), 2)
+                self.assertIsNotNone(api.calls[1][2], "点名 file_id 的 400 必须走重传")
+
     def test_archive_must_live_in_library(self):
         # 库外文件必须**真实存在**：不然圈禁被拆后会掉进「原图不见了」那条，
         # 异常类型一样，测试恒真假绿（变异测试逮出来的，别改回去）
