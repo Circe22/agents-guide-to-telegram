@@ -159,9 +159,16 @@ def save_library(stickers: list[dict[str, Any]]) -> None:
 
 
 def key_index(stickers: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """emoji 键（主 emoji + emojis[] 别名，剥掉变体选择符）→ 贴纸池。"""
+    """emoji 键（主 emoji + emojis[] 别名，剥掉变体选择符）→ 贴纸池。
+
+    `kind` 非 sticker 的条目（photo 等）不进贴纸池——那是别的车道的东西，
+    进来只会被 sendSticker 拒收（sticker-spec 漂移#1 裁决）。无 kind 视为 sticker
+    （本仓 import 从不写 kind，这条防的是外部库直接投喂的场景）。
+    """
     index: dict[str, list[dict[str, Any]]] = {}
     for entry in stickers:
+        if str(entry.get("kind") or "sticker") != "sticker":
+            continue
         keys = [str(entry.get("emoji") or "")] + [
             str(e) for e in entry.get("emojis") or [] if isinstance(e, str)
         ]
@@ -309,6 +316,10 @@ def tool_sticker_send(args: dict[str, Any], chat_id: str, token: str,
         matches = [e for e in stickers if str(e.get("id")) == raw_id]
         if not matches:
             raise ValueError(f"馆藏里没有 {raw_id} 号（先不带参数调一次看清单）")
+        if str(matches[0].get("kind") or "sticker") != "sticker":
+            raise ValueError(
+                f"馆藏 {raw_id} 号是 {matches[0].get('kind')} 不是贴纸——"
+                "这条车道只发贴纸，sendSticker 会拒收它")
         return send_entry(matches[0], chat_id, token, api)
 
     if emoji:

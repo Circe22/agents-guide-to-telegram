@@ -1,34 +1,118 @@
 {
   "note": "split（位置即语义）用例：input 是整条正文，expect 是段序列——\"text:<内容>\" 或 \"sticker:<池titles排序|连接>\"。断言的是池不是选中项（selector 的随机性不进 fixtures）。文本首尾避免空白（无命中时两端 strip/原样行为不同，那属实现自由，README 有记）。",
   "cases": [
-    {"name": "position_is_semantics", "input": "A\n（😢）\nB\n（😏）",
-     "expect": ["text:A", "sticker:CRY_A", "text:B", "sticker:SMUG"]},
-    {"name": "stage_direction_untouched", "input": "（挑眉）你好（点头）",
-     "expect": ["text:（挑眉）你好（点头）"]},
-    {"name": "inline_code_masked", "input": "语法是 `（😢）` 这样",
-     "expect": ["text:语法是 `（😢）` 这样"]},
-    {"name": "fence_masked", "input": "```\n（😢）\n```\n好",
-     "expect": ["text:```\n（😢）\n```\n好"]},
-    {"name": "unknown_left_verbatim", "input": "好（🦄）走",
-     "expect": ["text:好（🦄）走"]},
-    {"name": "halfwidth_parens", "input": "来 (😏)",
-     "expect": ["text:来", "sticker:SMUG"]},
-    {"name": "sticker_only_message", "input": "（😢）",
-     "expect": ["sticker:CRY_A"]},
-    {"name": "max_three_fourth_left", "input": "（😢）a（😏）b（🧑‍💻）c（😴）",
-     "expect": ["sticker:CRY_A", "text:a", "sticker:SMUG", "text:b", "sticker:CODER", "text:c（😴）"]},
-    {"name": "mid_sentence_splits", "input": "好啊（😏）现在就去",
-     "expect": ["text:好啊", "sticker:SMUG", "text:现在就去"]},
-    {"name": "empty_intersection_left_verbatim", "input": "（🥺💻）",
-     "expect": ["text:（🥺💻）"]},
-    {"name": "cross_hit_in_text", "input": "在看书\n（📖😭）",
-     "expect": ["text:在看书", "sticker:CRY_BOOK"]},
-    {"name": "alias_pool_merged_in_split", "input": "嗯\n（😭）",
-     "expect": ["text:嗯", "sticker:CRY_A|CRY_BOOK"]},
-    {"name": "long_marker_17_to_32_codepoints", "input": "哈哈\n（🧑‍💻🧑‍💻🧑‍💻🧑‍💻🧑‍💻🧑‍💻）",
-     "expect": ["text:哈哈", "sticker:CODER"],
-     "known": {"ts": "TS 标记正则内容上限 16 码位（u 模式量词按码位），Python 32；6×🧑‍💻=18 码位落在缝里；spec 裁决：统一 32"}},
-    {"name": "marker_within_16_codepoints_both_accept", "input": "哈哈\n（🧑‍💻🧑‍💻🧑‍💻🧑‍💻）",
-     "expect": ["text:哈哈", "sticker:CODER"]}
+    {
+      "name": "position_is_semantics",
+      "input": "A\n（😢）\nB\n（😏）",
+      "expect": [
+        "text:A",
+        "sticker:CRY_A",
+        "text:B",
+        "sticker:SMUG"
+      ]
+    },
+    {
+      "name": "stage_direction_untouched",
+      "input": "（挑眉）你好（点头）",
+      "expect": [
+        "text:（挑眉）你好（点头）"
+      ]
+    },
+    {
+      "name": "inline_code_masked",
+      "input": "语法是 `（😢）` 这样",
+      "expect": [
+        "text:语法是 `（😢）` 这样"
+      ]
+    },
+    {
+      "name": "fence_masked",
+      "input": "```\n（😢）\n```\n好",
+      "expect": [
+        "text:```\n（😢）\n```\n好"
+      ]
+    },
+    {
+      "name": "unknown_left_verbatim",
+      "input": "好（🦄）走",
+      "expect": [
+        "text:好（🦄）走"
+      ]
+    },
+    {
+      "name": "halfwidth_parens",
+      "input": "来 (😏)",
+      "expect": [
+        "text:来",
+        "sticker:SMUG"
+      ]
+    },
+    {
+      "name": "sticker_only_message",
+      "input": "（😢）",
+      "expect": [
+        "sticker:CRY_A"
+      ]
+    },
+    {
+      "name": "max_three_fourth_left",
+      "input": "（😢）a（😏）b（🧑‍💻）c（😴）",
+      "expect": [
+        "sticker:CRY_A",
+        "text:a",
+        "sticker:SMUG",
+        "text:b",
+        "sticker:CODER",
+        "text:c（😴）"
+      ]
+    },
+    {
+      "name": "mid_sentence_splits",
+      "input": "好啊（😏）现在就去",
+      "expect": [
+        "text:好啊",
+        "sticker:SMUG",
+        "text:现在就去"
+      ]
+    },
+    {
+      "name": "empty_intersection_left_verbatim",
+      "input": "（🥺💻）",
+      "expect": [
+        "text:（🥺💻）"
+      ]
+    },
+    {
+      "name": "cross_hit_in_text",
+      "input": "在看书\n（📖😭）",
+      "expect": [
+        "text:在看书",
+        "sticker:CRY_BOOK"
+      ]
+    },
+    {
+      "name": "alias_pool_merged_in_split",
+      "input": "嗯\n（😭）",
+      "expect": [
+        "text:嗯",
+        "sticker:CRY_A|CRY_BOOK"
+      ]
+    },
+    {
+      "name": "long_marker_17_to_32_codepoints",
+      "input": "哈哈\n（🧑‍💻🧑‍💻🧑‍💻🧑‍💻🧑‍💻🧑‍💻）",
+      "expect": [
+        "text:哈哈",
+        "sticker:CODER"
+      ]
+    },
+    {
+      "name": "marker_within_16_codepoints_both_accept",
+      "input": "哈哈\n（🧑‍💻🧑‍💻🧑‍💻🧑‍💻）",
+      "expect": [
+        "text:哈哈",
+        "sticker:CODER"
+      ]
+    }
   ]
 }

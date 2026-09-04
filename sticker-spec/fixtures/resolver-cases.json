@@ -101,20 +101,14 @@
     {
       "name": "kind_photo_excluded",
       "input": "🖼",
-      "expect": null,
-      "known": {
-        "python": "load_library/key_index 不看 kind，photo 条目也进贴纸池；spec 裁决：kind 非 sticker 不进贴纸车道"
-      }
+      "expect": null
     },
     {
       "name": "vs15_stripped_on_query",
       "input": "😢︎",
       "expect": [
         "CRY_A"
-      ],
-      "known": {
-        "ts": "TS 只剥 VS16(FE0F) 不剥 VS15(FE0E)；spec 裁决：两个变体选择符都剥"
-      }
+      ]
     }
   ]
 }
