@@ -1,0 +1,120 @@
+{
+  "note": "resolver 语义用例：input 是标记括号里的内容，runner 包一层全角括号走完整 split 管线执行（不许把 resolver 逻辑复刻进 runner——抄本会漂移）。expect: null=标记不认、原样留在正文；数组=候选池的 titles（排序后比对，池随机选中哪张不在断言范围）。known: {实现: 原因}=该实现已知不符 spec 裁决（严格 xfail：修好后必须摘牌，XPASS 算失败）。",
+  "cases": [
+    {
+      "name": "single_emoji_pool",
+      "input": "😢",
+      "expect": [
+        "CRY_A"
+      ]
+    },
+    {
+      "name": "alias_merges_pool",
+      "input": "😭",
+      "expect": [
+        "CRY_A",
+        "CRY_BOOK"
+      ]
+    },
+    {
+      "name": "cross_narrows_to_one",
+      "input": "📖😭",
+      "expect": [
+        "CRY_BOOK"
+      ]
+    },
+    {
+      "name": "order_irrelevant",
+      "input": "😭📖",
+      "expect": [
+        "CRY_BOOK"
+      ]
+    },
+    {
+      "name": "empty_intersection",
+      "input": "🥺💻",
+      "expect": null
+    },
+    {
+      "name": "unknown_member_kills_marker",
+      "input": "😭🦄",
+      "expect": null
+    },
+    {
+      "name": "unknown_single",
+      "input": "🦄",
+      "expect": null
+    },
+    {
+      "name": "zwj_whole_string_first",
+      "input": "🧑‍💻",
+      "expect": [
+        "CODER"
+      ]
+    },
+    {
+      "name": "vs16_stripped_on_query",
+      "input": "⌨️",
+      "expect": [
+        "KEYBOARD"
+      ]
+    },
+    {
+      "name": "vs16_bare_also_hits",
+      "input": "⌨",
+      "expect": [
+        "KEYBOARD"
+      ]
+    },
+    {
+      "name": "textual_rejected",
+      "input": "挑眉",
+      "expect": null
+    },
+    {
+      "name": "digit_rejected",
+      "input": "1",
+      "expect": null
+    },
+    {
+      "name": "same_emoji_two_entries",
+      "input": "😴",
+      "expect": [
+        "SLEEP_A",
+        "SLEEP_B"
+      ]
+    },
+    {
+      "name": "cross_with_alias",
+      "input": "💤😴",
+      "expect": [
+        "SLEEP_A"
+      ]
+    },
+    {
+      "name": "duplicate_emoji_in_marker",
+      "input": "😭😭📖",
+      "expect": [
+        "CRY_BOOK"
+      ]
+    },
+    {
+      "name": "kind_photo_excluded",
+      "input": "🖼",
+      "expect": null,
+      "known": {
+        "python": "load_library/key_index 不看 kind，photo 条目也进贴纸池；spec 裁决：kind 非 sticker 不进贴纸车道"
+      }
+    },
+    {
+      "name": "vs15_stripped_on_query",
+      "input": "😢︎",
+      "expect": [
+        "CRY_A"
+      ],
+      "known": {
+        "ts": "TS 只剥 VS16(FE0F) 不剥 VS15(FE0E)；spec 裁决：两个变体选择符都剥"
+      }
+    }
+  ]
+}

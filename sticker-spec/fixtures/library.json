@@ -1,0 +1,13 @@
+{
+  "note": "conformance 合成库——只为 sticker-spec fixtures 服务。titles 是断言身份（全大写 token，避免字面歧义）。不要放真贴纸、不要改 id 复用给别的测试。",
+  "stickers": [
+    {"id": 0, "kind": "sticker", "title": "CRY_A", "desc": "", "tags": [], "emoji": "😢", "emojis": ["😭", "🥺"], "file": "img/000.webp", "file_unique_id": "U0"},
+    {"id": 1, "kind": "sticker", "title": "CRY_BOOK", "desc": "", "tags": [], "emoji": "😭", "emojis": ["📖"], "file": "img/001.webp", "file_unique_id": "U1"},
+    {"id": 2, "kind": "sticker", "title": "SMUG", "desc": "", "tags": [], "emoji": "😏", "emojis": [], "file": "img/002.webp", "file_unique_id": "U2"},
+    {"id": 3, "kind": "sticker", "title": "CODER", "desc": "", "tags": [], "emoji": "🧑‍💻", "emojis": ["💻"], "file": "img/003.webp", "file_unique_id": "U3"},
+    {"id": 4, "kind": "sticker", "title": "KEYBOARD", "desc": "", "tags": [], "emoji": "⌨️", "emojis": [], "file": "img/004.webp", "file_unique_id": "U4"},
+    {"id": 5, "kind": "photo", "title": "PHOTO_NOT_STICKER", "desc": "", "tags": [], "emoji": "🖼", "emojis": [], "file": "img/005.jpg", "file_unique_id": "U5"},
+    {"id": 6, "kind": "sticker", "title": "SLEEP_A", "desc": "", "tags": [], "emoji": "😴", "emojis": ["💤"], "file": "img/006.webp", "file_unique_id": "U6"},
+    {"id": 7, "kind": "sticker", "title": "SLEEP_B", "desc": "", "tags": [], "emoji": "😴", "emojis": [], "file": "img/007.webp", "file_unique_id": "U7"}
+  ]
+}
