@@ -28,8 +28,17 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import secret_redaction  # noqa: E402
-import tg_progress_hook as hook  # noqa: E402
 import tg_rich_mcp as mcp  # noqa: E402
+
+# 进度窗 hook 是 Unix-only（fcntl），Windows 上 import 就炸。
+# server 核心（tg_rich_mcp/tg_sticker/tg_ask/secret_redaction）承诺全平台，
+# 所以 hook 的测试按平台跳过、其余照跑——Windows CI 靠这一层过活。
+try:
+    import tg_progress_hook as hook  # noqa: E402
+except ImportError:                  # pragma: no cover - 只在 Windows 走到
+    hook = None
+
+needs_hook = unittest.skipIf(hook is None, "tg_progress_hook 是 Unix-only（fcntl）")
 
 FAKE_TOKEN = "123456789:AAH" + "x" * 32
 LEAK_URL = f"https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage"
@@ -93,6 +102,7 @@ class Redaction(unittest.TestCase):
             with self.subTest(benign=benign):
                 self.assertEqual(mcp._scrub_out(benign), benign)
 
+    @needs_hook
     def test_fallback_copy_matches_source_of_truth(self):
         """盯的必须是**副本的字面量**。
 
@@ -102,6 +112,7 @@ class Redaction(unittest.TestCase):
         self.assertEqual(hook._FALLBACK_TELEGRAM_TOKEN_PATTERN,
                          secret_redaction.TELEGRAM_BOT_TOKEN_RE.pattern)
 
+    @needs_hook
     def test_fallback_copy_actually_works(self):
         """副本自己也得真拦得住，不能只是长得一样。"""
         fallback = __import__("re").compile(hook._FALLBACK_TELEGRAM_TOKEN_PATTERN)
@@ -206,6 +217,7 @@ class Protocol(unittest.TestCase):
         self.assertEqual(len(names), 6)   # rich 三件 + 贴纸两件 + 按钮选择题一件
 
 
+@needs_hook
 class ToolSummaries(unittest.TestCase):
     """进度窗只推工具名 + 一句安全摘要，绝不推内容。"""
 
@@ -269,6 +281,7 @@ class ToolSummaries(unittest.TestCase):
             os.environ.pop("TG_PROGRESS_REDACT", None)
 
 
+@needs_hook
 class ProgressBlocks(unittest.TestCase):
     def test_thinking_block_only_in_draft(self):
         """thinking 进不了正式消息，照搬会被 API 拒收。"""
@@ -345,6 +358,7 @@ class EditLast(unittest.TestCase):
             mcp.tool_edit({"markdown": "x", "chat_id": "另一个聊天"})
 
 
+@needs_hook
 class FrameOrdering(unittest.TestCase):
     """慢帧不能把新内容盖回去（窗口倒退）。"""
 
@@ -536,6 +550,7 @@ class MediaUpload(unittest.TestCase):
         self.assertEqual(mcp.extract_file_ids(result), ["big"])
 
 
+@needs_hook
 class ConcurrentStateWrites(unittest.TestCase):
     """并行工具调用会同时写状态文件——无锁时后写的覆盖先写的。"""
 
@@ -697,6 +712,134 @@ class DraftCanStop(unittest.TestCase):
         _, data = self.calls[0]
         self.assertEqual(data.get("can_stop"), "true")
         self.assertEqual(data.get("keep_on_stop"), "true")
+
+
+@needs_hook
+class StopVsInflightPushFence(unittest.TestCase):
+    """Stop ↔ 在途推送的竞态（澄 2026-09-04 审出）。
+
+    病灶：push 的 sendRichMessage 还在飞，_finish 先读到 msg_id=0 清了账退场，
+    随后 push 返回把新 msg_id 写回来——任务结束后反而冒出一扇孤儿进度窗。
+    修法是代际栅栏（gen fence）：finish 关账时 gen+1；晚归的 push CAS(gen) 失败，
+    不登记、并把自己刚发出去的消息删掉。**普通锁挡不住这个**——锁管「别同时写」，
+    管不了「这一轮已经死了别再写」。
+
+    反向变异：把 _push_locked 里的 _amend_if_gen 换回 _amend（或把 finish 的
+    gen+1 拿掉），test_finish_beats_inflight_push_no_orphan 两条断言都必须转红。
+    """
+
+    def setUp(self):
+        import threading
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_dir = hook.STATE_DIR
+        hook.STATE_DIR = Path(self.tmp.name)
+        self.had = {k: os.environ.get(k) for k in
+                    ("TG_CHAT_ID", "TG_PROGRESS_MODE", "TG_PROGRESS_END")}
+        os.environ["TG_CHAT_ID"] = "888"
+        os.environ.pop("TG_PROGRESS_MODE", None)   # edit 模式
+        os.environ.pop("TG_PROGRESS_END", None)    # delete 收场
+        self.original = mcp.call_api
+        self.send_started = threading.Event()
+        self.release = threading.Event()
+        self.calls: list[tuple[str, dict]] = []
+
+        def fake(method, data, files=None):
+            if method == "sendRichMessage":
+                self.send_started.set()
+                self.release.wait(5)               # 卡住请求，模拟网络在飞
+            self.calls.append((method, dict(data)))
+            return {"result": {"message_id": 77}}
+
+        mcp.call_api = fake
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        hook.STATE_DIR = self.old_dir
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _seed(self, **extra) -> Path:
+        import time as _t
+        state = {"seq": 1, "gen": 0, "claim": 1, "claim_at": _t.time(),
+                 "lines": ["⚡ Bash"], "total": 1, "last_push": _t.time(),
+                 "draft_id": 9}
+        state.update(extra)
+        path = hook._state_path("s1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        return path
+
+    def _deleted(self) -> list[int]:
+        return [int(d.get("message_id") or 0)
+                for m, d in self.calls if m == "deleteMessage"]
+
+    def test_finish_beats_inflight_push_no_orphan(self):
+        # 澄点名的那支：卡住 sendRichMessage → 触发 finish → 放行请求
+        import threading
+        path = self._seed()
+        worker = threading.Thread(target=hook._push, args=(path, 1))
+        worker.start()
+        self.assertTrue(self.send_started.wait(5), "send 没起飞，测试环境不对")
+        hook._finish_session("s1")                 # 请求还在飞时收窗
+        self.release.set()
+        worker.join(5)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(int(state.get("msg_id") or 0), 0,
+                         "孤儿窗被重新登记——栅栏失效")
+        self.assertIn(77, self._deleted(),
+                      "晚归的消息没有自我了断——聊天里会留一扇孤儿窗")
+
+    def test_normal_finish_deletes_registered_window(self):
+        # 无并发的老路径不许被栅栏改坏：已登记的窗收工照删
+        path = self._seed(msg_id=42)
+        self.release.set()
+        hook._finish_session("s1")
+        self.assertEqual(self._deleted(), [42])
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(int(state.get("msg_id") or 0), 0)
+        self.assertEqual(int(state.get("gen") or 0), 1)
+
+    def test_amend_if_gen_refuses_stale_writer(self):
+        path = self._seed(gen=5)
+        self.assertFalse(hook._amend_if_gen(path, 4, {"msg_id": 99}))
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("msg_id", state)
+        self.assertTrue(hook._amend_if_gen(path, 5, {"msg_id": 99}))
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(state["msg_id"], 99)
+
+    def test_stale_edit_failure_cannot_wipe_new_round(self):
+        # 编辑失败的让位补丁也要过栅栏：旧轮的「松手」不许清掉新一轮的窗。
+        # 关键在时序——push 必须在 finish **之前**读走旧账（gen=0）并卡在编辑上，
+        # 等 finish 开出新一轮（gen=1、开了 55 号窗）后才失败让位。
+        import threading
+        path = self._seed(msg_id=42)          # 旧轮：有窗可编辑
+        edit_started = threading.Event()
+        release_edit = threading.Event()
+
+        def flaky(method, data, files=None):
+            self.calls.append((method, dict(data)))
+            if method == "editMessageText":
+                edit_started.set()
+                release_edit.wait(5)
+                raise RuntimeError("消息没了")
+            return {"result": {"message_id": 77}}
+
+        mcp.call_api = flaky
+        worker = threading.Thread(target=hook._push, args=(path, 1))
+        worker.start()
+        self.assertTrue(edit_started.wait(5), "edit 没起飞，测试环境不对")
+        hook._finish_session("s1")                                   # gen 0→1
+        hook._amend(path, {"msg_id": 55, "claim": 7, "claim_at": 1.0})  # 新一轮已开窗
+        release_edit.set()
+        worker.join(5)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(int(state.get("msg_id") or 0), 55,
+                         "旧轮 push 把新一轮的窗清掉了")
 
 
 if __name__ == "__main__":

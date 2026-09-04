@@ -263,6 +263,31 @@ def _amend(state_path: Path, patch: dict) -> None:
         pass
 
 
+def _amend_if_gen(state_path: Path, gen: int, patch: dict) -> bool:
+    """代际栅栏版 _amend：只有 state 还停在同一代（gen 没变）才写，写了返回 True。
+
+    锁管的是「别同时写」，管不了「这一轮已经结束了别再写」——Stop 收窗 /
+    ROUND_GAP 开新轮都会把 gen +1，晚归的推送子进程据此发现自己写的是
+    上一代的账，放弃登记（并把自己刚发出去的消息删掉，见 _push_locked）。
+    """
+    try:
+        with open(str(state_path) + ".lock", "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    state = {}
+            except Exception:
+                state = {}
+            if int(state.get("gen") or 0) != int(gen):
+                return False
+            state.update(patch)
+            _atomic_write(state_path, state)
+            return True
+    except Exception:
+        return False
+
+
 def _blocks(lines: list[str], total: int, done: bool = False,
             draft: bool = False) -> list[dict]:
     # total 必须单独记：lines 只留最近 40 条，拿 len(lines) 当步数的话，
@@ -317,6 +342,7 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         lines = state.get("lines") or []
         total = int(state.get("total") or 0)
+        gen = int(state.get("gen") or 0)   # 这一帧属于哪一代，登记时要对得上
 
         if _mode() == "draft":
             # 锁内重读之后再比 seq：已经有更新的帧了就让位，反正它马上到。
@@ -335,6 +361,16 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
         chat = _default_chat()
         if not chat:
             return 0
+
+        # 上一轮的孤儿窗（Stop hook 没跑到、ROUND_GAP 顶替收的场）：开新窗前先收掉
+        stale = int(state.get("stale_msg") or 0)
+        if stale:
+            try:
+                call_api("deleteMessage", {"chat_id": chat, "message_id": stale})
+            except Exception:
+                pass                     # 超 48 小时删不掉就算了，别挡新窗
+            _amend_if_gen(state_path, gen, {"stale_msg": 0})
+
         message_id = int(state.get("msg_id") or 0)
         if not message_id:
             # 开窗只能有一个人干，否则并发的几帧会各发一条，聊天里冒出好几扇窗。
@@ -348,7 +384,15 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
             })
             result = payload.get("result")
             if isinstance(result, dict) and result.get("message_id"):
-                _amend(state_path, {"msg_id": int(result["message_id"])})
+                mid = int(result["message_id"])
+                if not _amend_if_gen(state_path, gen, {"msg_id": mid}):
+                    # 网络请求还在飞的时候这一轮已经被收掉了（Stop / 新轮）。
+                    # 登记进去就是复活孤儿窗——不登记，并且把刚生出来的消息删掉。
+                    try:
+                        call_api("deleteMessage",
+                                 {"chat_id": chat, "message_id": mid})
+                    except Exception:
+                        pass
             return 0
 
         if seq and int(state.get("seq") or 0) != seq:
@@ -360,53 +404,83 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
                 "rich_message": _rich(_blocks(lines, total)),
             })
         except Exception:
-            # 那条消息没了（被删/被清），松开手，下一帧重新开一扇
-            _amend(state_path, {"msg_id": 0, "claim": 0, "claim_at": 0.0})
+            # 那条消息没了（被删/被清），松开手，下一帧重新开一扇。
+            # 也要过栅栏——这一轮已经结束的话，别把新一轮的 claim 清成孤儿。
+            _amend_if_gen(state_path, gen, {"msg_id": 0, "claim": 0, "claim_at": 0.0})
     except Exception:
         pass          # 铁律①：推送失败绝不影响 agent
     return 0
 
 
 def _finish() -> int:
-    """Stop hook：收工——默认把窗口撤掉，`keep` 时定格成终态。之后下一轮另开一扇。"""
+    """Stop hook 入口：解析 stdin 后交给 _finish_session（拆开是为了能被测试直调）。"""
     try:
         event = json.loads(sys.stdin.read(STDIN_LIMIT) or "{}")
         session = str(event.get("session_id") or "default")
     except Exception:
         return 0
+    return _finish_session(session)
 
+
+def _finish_session(session: str) -> int:
+    """收工——默认把窗口撤掉，`keep` 时定格成终态。之后下一轮另开一扇。
+
+    先关账、后善后：**第一步在 state 锁里一笔完成「gen+1 + 摘走 msg_id + 清空」**，
+    从这一刻起本轮就算死了——还在飞的推送子进程回来后 CAS(gen) 必然失败，
+    会自己把刚发出去的消息删掉（见 _push_locked），不会再有孤儿窗复活。
+    网络请求（删窗/定格）放在锁外做，别让 Telegram 的延迟拖住 Stop hook。
+    """
     state_path = _state_path(session)
+    message_id, lines, total = 0, [], 0
+    # —— 第一步：锁内关账（bump gen + 摘走待处理的 msg_id + 清空本轮）——
+    try:
+        with open(str(state_path) + ".lock", "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    state = {}
+            except Exception:
+                state = {}
+            message_id = int(state.get("msg_id") or 0)
+            lines = state.get("lines") or []
+            total = int(state.get("total") or 0)
+            state.update({
+                "gen": int(state.get("gen") or 0) + 1,
+                "msg_id": 0, "claim": 0, "claim_at": 0.0,
+                "lines": [], "total": 0, "last_push": 0.0,
+            })
+            _atomic_write(state_path, state)
+    except Exception:
+        return 0
+
+    # —— 第二步：锁外善后。只认 msg_id 不认当前模式：用户 edit 跑了半截、
+    # 重启改成 draft 时，账上挂着的持久窗照样要收掉。纯 draft 轮 msg_id=0 短路。
+    if not message_id:
+        return 0
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from tg_rich_mcp import _default_chat, call_api  # noqa: PLC0415
 
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        message_id = int(state.get("msg_id") or 0)
         chat = _default_chat()
-        # 只认 msg_id 不认当前模式：用户 edit 跑了半截、重启改成 draft 时，
-        # 账上挂着的持久窗照样要收掉，否则它成孤儿永远留在聊天里。
-        # 纯 draft 轮 msg_id=0，这儿天然短路。
-        if message_id and chat:
-            gone = False
-            if _end_mode() == "delete":
-                try:
-                    call_api("deleteMessage",
-                             {"chat_id": chat, "message_id": message_id})
-                    gone = True
-                except Exception:
-                    gone = False       # 超 48 小时删不掉，退回定格
-            if not gone:
-                call_api("editMessageText", {
-                    "chat_id": chat,
-                    "message_id": message_id,
-                    "rich_message": _rich(_blocks(state.get("lines") or [],
-                                                  int(state.get("total") or 0), done=True)),
-                })
+        if not chat:
+            return 0
+        gone = False
+        if _end_mode() == "delete":
+            try:
+                call_api("deleteMessage",
+                         {"chat_id": chat, "message_id": message_id})
+                gone = True
+            except Exception:
+                gone = False       # 超 48 小时删不掉，退回定格
+        if not gone:
+            call_api("editMessageText", {
+                "chat_id": chat,
+                "message_id": message_id,
+                "rich_message": _rich(_blocks(lines, total, done=True)),
+            })
     except Exception:
         pass
-    # 无论上面成没成，都把窗口交出去：下一轮从零开一扇新的
-    _amend(state_path, {"msg_id": 0, "claim": 0, "claim_at": 0.0,
-                        "lines": [], "total": 0, "last_push": 0.0})
     return 0
 
 
@@ -460,9 +534,16 @@ def main() -> int:
 
             now = time.time()
             # 冷了这么久还来一帧，多半是新的一轮（Stop hook 没挂 / 没跑到的兜底）。
-            # seq 接着往上走，别让在途的旧子进程撞上新号。
+            # seq 接着往上走，别让在途的旧子进程撞上新号；gen 也 +1——这是和
+            # _finish_session 同一套代际栅栏，旧轮在飞的推送不得再登记进新轮。
+            # 旧轮账上还挂着的窗（Stop 没跑到留下的）转进 stale_msg，
+            # 下一个推送子进程开新窗前顺手收掉（网络活不进 hook 主体，铁律②）。
             if now - float(state.get("last_push") or 0) > ROUND_GAP:
-                state = {"seq": int(state.get("seq") or 0)}
+                stale_msg = (int(state.get("msg_id") or 0)
+                             if _end_mode() == "delete" else 0)
+                state = {"seq": int(state.get("seq") or 0),
+                         "gen": int(state.get("gen") or 0) + 1,
+                         "stale_msg": stale_msg}
 
             state.setdefault("draft_id", _draft_id(session))
             if not isinstance(state.get("lines"), list):
