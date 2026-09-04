@@ -21,3 +21,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install requests
       - run: python -m unittest discover -v
+
+  # README 承诺 server 核心（tg_rich_mcp/tg_sticker/tg_ask/secret_redaction）
+  # 全平台——这档就是那句承诺的看门人。进度窗 hook 是 Unix-only（fcntl），
+  # 测试侧靠 @needs_hook 在 Windows 上自动跳过，不算食言。
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python -m unittest discover -v
