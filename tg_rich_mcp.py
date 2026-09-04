@@ -371,12 +371,34 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
 
     坑 17 的纪律就落在这儿：**分段记账**。贴纸段失败不牵连已送达的文字
     （话已经送到了，脸没送到只记一笔），整条也绝不自动重试。
+
+    孤儿贴纸防护：脸是贴给它前面那句话的（位置即语义），所以**脸不许先于
+    它所依附的那句话出门**。标记写在句首时贴纸段排在文字段前面，若照顺序发，
+    贴纸成功、正文随后失败＝对方收到一张没头没尾的脸——比缺一张脸更糟，那是
+    把语气安在了一句不存在的话上。规则：
+
+    - 整条没有正文段（纯贴纸）：照常直发，不存在孤儿问题；
+    - 有正文段：贴纸挂起，第一条正文真送达后立刻补发，位置不变；
+    - 正文抛错：整条中断，挂起的脸永不发送（宁可什么都没收到）；
+    - 反过来不变：贴纸自己发失败，依旧不牵连正文（话比脸要紧）。
     """
     chat = _resolve_chat(args)
     token = _token()
     reply_to = _int_arg(args, "reply_to", "要引用的那条消息的 message_id")
     lines: list[str] = []
-    first = True
+    has_text = any(kind == "text" and payload for kind, payload in parts)
+    text_delivered = False
+    held: list[Any] = []   # 正文落地前挂起的贴纸段
+
+    def _fire(payload: Any) -> None:
+        pool, combo, raw = payload
+        try:
+            entry = tg_sticker.pick(pool, combo)
+            tg_sticker.send_entry(entry, chat, token, call_api)
+            lines.append(f"贴纸「{entry.get('title')}」← 标记 {raw}")
+        except (RuntimeError, ValueError, OSError) as exc:
+            lines.append(f"贴纸未送达 ← 标记 {raw}（{exc}）")
+
     for kind, payload in parts:
         if kind == "text":
             if not payload:
@@ -387,7 +409,7 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
             }
             if args.get("silent"):
                 data["disable_notification"] = "true"
-            if first and reply_to:
+            if not text_delivered and reply_to:
                 data["reply_parameters"] = json.dumps({"message_id": reply_to})
             response = call_api("sendRichMessage", data)
             result = response.get("result")
@@ -395,15 +417,17 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
             if isinstance(mid, int):
                 _LAST_SENT[chat] = mid
             lines.append(f"文字段（message_id: {mid}）")
+            text_delivered = True
+            for pending in held:
+                _fire(pending)
+            held.clear()
         else:
-            pool, combo, raw = payload
-            try:
-                entry = tg_sticker.pick(pool, combo)
-                tg_sticker.send_entry(entry, chat, token, call_api)
-                lines.append(f"贴纸「{entry.get('title')}」← 标记 {raw}")
-            except (RuntimeError, ValueError, OSError) as exc:
-                lines.append(f"贴纸未送达 ← 标记 {raw}（{exc}）")
-        first = False
+            if has_text and not text_delivered:
+                held.append(payload)   # 脸先憋着，等它依附的话真送到
+            else:
+                _fire(payload)
+    for pending in held:   # 走完了正文却一条都没送出去：记账，不补发
+        lines.append(f"贴纸未送达 ← 标记 {pending[2]}（正文未送达，孤儿防护挂起）")
     return (
         "已按标记位置分段送达：\n  " + "\n  ".join(lines)
         + "\n（句内贴纸标记层可用 TG_STICKER_MARKERS=0 整体关闭）"

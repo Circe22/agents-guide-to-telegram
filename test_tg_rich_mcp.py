@@ -565,5 +565,91 @@ class ConcurrentStateWrites(unittest.TestCase):
             self.assertLessEqual(len(state["lines"]), 40, "lines 应该截断在 40")
 
 
+class OrphanStickerGuard(unittest.TestCase):
+    """孤儿贴纸防护：脸不许先于它所依附的那句话出门。
+
+    位置即语义——脸是贴给它前面那句话的。贴纸先送达、正文随后失败＝对方收到
+    一张没头没尾的脸，比缺一张脸更糟。这组测试拆掉防护必须转红：
+    `test_leading_sticker_waits_for_text`（顺序翻转）和
+    `test_text_failure_never_sends_the_face`（孤儿脸照发）就是那两支反向探针。
+    """
+
+    def setUp(self):
+        from test_tg_sticker import make_library
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["TG_STICKER_DIR"] = self.tmp.name
+        make_library(Path(self.tmp.name))
+        self.had = {k: os.environ.get(k) for k in ("TG_CHAT_ID", "TG_BOT_TOKEN")}
+        os.environ["TG_CHAT_ID"] = "-100555"
+        os.environ["TG_BOT_TOKEN"] = FAKE_TOKEN
+        self.calls: list[tuple[str, dict]] = []
+        self.fail_on: str | None = None
+        self.original = mcp.call_api
+
+        def fake(method, data, files=None):
+            if method == self.fail_on:
+                raise RuntimeError("模拟：这条 API 炸了")
+            self.calls.append((method, dict(data)))
+            return {"ok": True, "result": {
+                "message_id": len(self.calls),
+                "sticker": {"file_id": "FRESH", "file_unique_id": "UNIQ0"},
+            }}
+
+        mcp.call_api = fake
+        mcp._LAST_SENT.clear()
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        os.environ.pop("TG_STICKER_DIR", None)
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        mcp._LAST_SENT.clear()
+        self.tmp.cleanup()
+
+    def methods(self) -> list[str]:
+        return [m for m, _ in self.calls]
+
+    def test_leading_sticker_waits_for_text(self):
+        # 标记在句首：贴纸段排在文字段前面，但发送顺序必须是话先出门
+        out = mcp.tool_send({"markdown": "（😭）我错了"})
+        self.assertEqual(self.methods(), ["sendRichMessage", "sendSticker"])
+        self.assertIn("贴纸「大哭猫」", out)
+
+    def test_text_failure_never_sends_the_face(self):
+        # 正文炸了 ⇒ 挂起的脸永不发送——宁可对方什么都没收到
+        self.fail_on = "sendRichMessage"
+        with self.assertRaises(RuntimeError):
+            mcp.tool_send({"markdown": "（😭）我错了"})
+        self.assertNotIn("sendSticker", self.methods())
+
+    def test_pure_sticker_message_goes_straight_out(self):
+        # 没有正文段＝没有"所依附的那句话"，不存在孤儿问题，照常直发
+        mcp.tool_send({"markdown": "（😭）"})
+        self.assertEqual(self.methods(), ["sendSticker"])
+
+    def test_sticker_between_texts_keeps_position(self):
+        # 前面已有正文送达的贴纸不受防护影响，位置即语义原样保住
+        mcp.tool_send({"markdown": "第一句（😭）第二句"})
+        self.assertEqual(self.methods(),
+                         ["sendRichMessage", "sendSticker", "sendRichMessage"])
+
+    def test_sticker_failure_still_spares_the_text(self):
+        # 反过来不变：脸发失败不牵连正文（坑 17 的老纪律，v4 一个字没动）
+        self.fail_on = "sendSticker"
+        out = mcp.tool_send({"markdown": "第一句（😭）第二句"})
+        self.assertEqual(self.methods().count("sendRichMessage"), 2)
+        self.assertIn("贴纸未送达", out)
+
+    def test_reply_to_lands_on_first_delivered_text(self):
+        # 句首贴纸被挂起后，引用回复应该落在第一条真送出去的正文上
+        mcp.tool_send({"markdown": "（😭）我错了", "reply_to": "42"})
+        method, data = self.calls[0]
+        self.assertEqual(method, "sendRichMessage")
+        self.assertIn('"message_id": 42', data.get("reply_parameters", ""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
