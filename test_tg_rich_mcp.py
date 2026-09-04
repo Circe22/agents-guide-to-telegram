@@ -549,6 +549,39 @@ class MediaUpload(unittest.TestCase):
         ]}}
         self.assertEqual(mcp.extract_file_ids(result), ["big"])
 
+    def test_total_budget_rejects_legal_singles_that_sum_over(self):
+        """澄审 P1-2 点名的反例：每个文件都合法，加在一起超总预算——必须拒。
+
+        不设总量闸的话 50 × 50MB ＝ 一次调用先吃 2.5GB RSS。
+        预算缩到 1MB 来测（600KB × 2 单个合法、合计超），断言盯「总预算」
+        字样——单文件闸误拦的话报的是 50MB 上限，这条会红。
+        """
+        os.environ["TG_RICH_MEDIA_TOTAL_MB"] = "1"
+        try:
+            a = self.img("a.jpg", b"x" * (600 * 1024))
+            b = self.img("b.jpg", b"y" * (600 * 1024))
+            with self.assertRaises(ValueError) as ctx:
+                mcp.load_media([a, b])
+            self.assertIn("总预算", str(ctx.exception))
+            # 单发每一个都必须还过得去——证明拦的真是「累计」不是「单个」
+            self.assertEqual(list(mcp.load_media([a])), ["f0"])
+            self.assertEqual(list(mcp.load_media([b])), ["f0"])
+        finally:
+            os.environ.pop("TG_RICH_MEDIA_TOTAL_MB", None)
+
+    def test_total_budget_default_leaves_normal_batches_alone(self):
+        # 默认 200MB：正常九宫格（9 × 小图）一根汗毛都不该动
+        batch = [self.img(f"p{i}.jpg") for i in range(9)]
+        self.assertEqual(len(mcp.load_media(batch)), 9)
+
+    def test_total_budget_bad_env_falls_back(self):
+        os.environ["TG_RICH_MEDIA_TOTAL_MB"] = "胡写的"
+        try:
+            self.assertEqual(mcp._media_total_budget(),
+                             mcp.MEDIA_MAX_TOTAL_MB_DEFAULT * 1024 * 1024)
+        finally:
+            os.environ.pop("TG_RICH_MEDIA_TOTAL_MB", None)
+
 
 @needs_hook
 class ConcurrentStateWrites(unittest.TestCase):

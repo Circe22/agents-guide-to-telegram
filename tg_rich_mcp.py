@@ -164,6 +164,20 @@ def _text_error(body: str) -> dict[str, Any]:
 # ---------- 媒体上传 ----------
 MEDIA_MAX_BYTES = 50 * 1024 * 1024   # Bot API 上限：上传文件最大 50MB
 MEDIA_MAX_COUNT = 50                  # 官方：一条富消息最多 50 个媒体附件
+# 总内存预算：load_media 把每个文件整个读进内存拼 multipart，单文件≤50MB ×
+# 最多 50 个＝理论上一次调用能吃 2.5GB RSS（澄 2026-09-04 审出）。默认 200MB
+# 已经装得下正经的九宫格/轮播；真要超大批量该走流式 multipart，不是抬预算。
+MEDIA_MAX_TOTAL_MB_DEFAULT = 200
+
+
+def _media_total_budget() -> int:
+    """总预算（字节）。`TG_RICH_MEDIA_TOTAL_MB` 可调，坏值回落默认。"""
+    raw = (os.environ.get("TG_RICH_MEDIA_TOTAL_MB") or "").strip()
+    try:
+        mb = int(raw) if raw else MEDIA_MAX_TOTAL_MB_DEFAULT
+    except ValueError:
+        mb = MEDIA_MAX_TOTAL_MB_DEFAULT
+    return max(1, mb) * 1024 * 1024
 
 # 文件名形态闸：agent 拿到的是"发这个路径"，它自己不看内容——
 # 这道闸拦的是把凭证文件当图发出去的那类事故。保守设计，会误伤
@@ -191,6 +205,8 @@ def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
         raise ValueError(f"一条富消息最多 {MEDIA_MAX_COUNT} 个媒体（给了 {len(paths)} 个）")
 
     files: dict[str, tuple[str, bytes]] = {}
+    budget = _media_total_budget()
+    total = 0
     for i, raw in enumerate(paths):
         path = Path(raw).expanduser()
         if not path.is_file():
@@ -209,7 +225,18 @@ def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
                 f"media_paths[{i}] 超过 Bot API 的 50MB 上限"
                 f"（{size / 1024 / 1024:.0f}MB）：{path.name}"
             )
-        files[f"f{i}"] = (path.name, real.read_bytes())
+        # 总量预算按**实际读到的字节**累计，不信 stat——stat 与 read 之间
+        # 文件可能又长了（TOCTOU），预算要拦的是内存，就按进了内存的算。
+        blob = real.read_bytes()
+        total += len(blob)
+        if total > budget:
+            raise ValueError(
+                f"media_paths 累计 {total / 1024 / 1024:.0f}MB，超过总预算 "
+                f"{budget // (1024 * 1024)}MB（每个文件都合法≠一起发合法——"
+                "全部读进内存拼 multipart 会吃光 RSS）。分几条消息发，"
+                "或按需调 TG_RICH_MEDIA_TOTAL_MB"
+            )
+        files[f"f{i}"] = (path.name, blob)
     return files
 
 
@@ -650,7 +677,8 @@ TOOLS = (
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "要上传的本地文件（绝对路径，每个≤50MB，最多 50 个）。"
+                        "要上传的本地文件（绝对路径，每个≤50MB，最多 50 个，"
+                        "累计默认≤200MB[TG_RICH_MEDIA_TOTAL_MB 可调]）。"
                         "只配 blocks 用：第 i 个路径在 blocks 里用 attach://f{i} 引用"
                         "（见配方⑧）。发送成功会返回各媒体的 file_id，存下来下次直接填"
                         " file_id 复用，不用重新上传。"
