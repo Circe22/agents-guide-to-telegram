@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.dont_write_bytecode = True   # 防 pyc 缓存投毒（变异测试的教训）
 
@@ -546,6 +549,171 @@ class TestHookScan(Base):
     def test_never_raises_on_garbage(self):
         for garbage in ("", "<channel", "attachment_kind=\"sticker\"", "純文字"):
             tg_sticker_hook.scan(garbage)   # 不炸即过
+
+
+# ---------- R3：系统锁的活性/互斥（同进程 fcntl 版，非 fcntl 平台跳过） ----------
+@unittest.skipUnless(tg_sticker._fcntl is not None,
+                     "同进程两句柄互斥依赖 flock（fcntl-only）；跨进程语义见下方 subprocess 用例")
+class TestLockSameProcess(Base):
+    """R3（收编审查反例 test_live_lock_holder_cannot_be_evicted_by_age）：
+    活持有者不因锁「年龄」被夺走。这是 fcntl 特有的同进程两句柄验证，Windows 走
+    下面的独立进程用例。
+
+    反向变异：给 `_CrossProcessLock` 重新加回「mtime 超龄就 unlink 夺回」，此测试
+    转红（B 会夺锁成功）。
+    """
+
+    def test_live_holder_cannot_be_evicted_by_age(self):
+        target = self.dir / "state.json"
+        a = tg_sticker._CrossProcessLock(target)
+        b = tg_sticker._CrossProcessLock(target)
+        a.__enter__()
+        acquired_b = False
+        try:
+            old = time.time() - 31          # 等价于活持有者被暂停超过旧的 30s 租约
+            os.utime(a.lock_path, (old, old))
+            with mock.patch.object(tg_sticker, "_LOCK_WAIT_SECONDS", 0.05):
+                try:
+                    b.__enter__()
+                    acquired_b = True
+                except TimeoutError:
+                    pass
+        finally:
+            if acquired_b:
+                b.__exit__(None, None, None)
+            a.__exit__(None, None, None)
+        self.assertFalse(acquired_b, "活持有者还攥着句柄，B 却按年龄夺到了锁")
+
+
+# ---------- R3：系统锁的四场景（澄拍板·独立进程·跨平台） ----------
+# 每个场景用**真实独立子进程**持锁，覆盖 Linux（本地 + CI）与 Windows（CI test-windows）。
+# 锁由内核按打开的句柄记账：进程死了内核自动释放，靠时间猜死活的租约逻辑已删掉。
+_LOCK_WORKER = r"""
+import os, sys, time
+from pathlib import Path
+sys.path.insert(0, os.environ["LOCKTEST_PKG"])
+import tg_sticker
+target, held_flag, release_flag, mode = sys.argv[1:5]
+lock = tg_sticker._CrossProcessLock(Path(target))
+lock.__enter__()
+Path(held_flag).write_text("held")
+deadline = time.time() + 30
+while not os.path.exists(release_flag) and time.time() < deadline:
+    time.sleep(0.02)
+if mode == "hardexit":
+    os._exit(1)          # 异常退出：跳过 __exit__，靠内核释放句柄锁
+lock.__exit__(None, None, None)
+"""
+
+
+class TestLockCrossProcess(Base):
+    """R3 锁验收（澄的四场景，独立进程）。同时收编审查反例
+    test_previous_owner_cannot_unlink_successors_lock 的业务结果：前持有者退出
+    绝不破坏后来者的互斥，且固定锁文件从不被 unlink。
+
+    这四条与同进程 fcntl 用例互补：那条证同进程两句柄互斥（Linux 特有），这四条
+    用真实独立进程覆盖两个平台，且 Windows CI 也真跑。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pkg = str(Path(tg_sticker.__file__).resolve().parent)
+        self.target = self.dir / "state.json"
+
+    def _spawn_holder(self, mode: str):
+        held = self.dir / f"held.{mode}.{os.getpid()}.{time.time_ns()}"
+        release = self.dir / f"release.{mode}.{os.getpid()}.{time.time_ns()}"
+        env = {**os.environ, "LOCKTEST_PKG": self.pkg}
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _LOCK_WORKER,
+             str(self.target), str(held), str(release), mode],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.addCleanup(self._reap, proc)
+        return proc, held, release
+
+    @staticmethod
+    def _reap(proc):
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+    @staticmethod
+    def _wait_file(path: Path, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _try_acquire(self, wait_seconds: float) -> bool:
+        lock = tg_sticker._CrossProcessLock(self.target)
+        with mock.patch.object(tg_sticker, "_LOCK_WAIT_SECONDS", wait_seconds):
+            try:
+                lock.__enter__()
+            except TimeoutError:
+                return False
+        lock.__exit__(None, None, None)
+        return True
+
+    def test_live_holder_not_evicted_however_long_we_wait(self):
+        # 场景①：活持有者，等再久也夺不走。
+        proc, held, release = self._spawn_holder("release")
+        try:
+            self.assertTrue(self._wait_file(held), "子进程没能拿到锁")
+            self.assertFalse(self._try_acquire(1.5),
+                             "活持有者还在，等待者却夺到了锁")
+            self.assertTrue(self.target.with_name("state.json.lock").exists(),
+                            "固定锁文件被谁 unlink 了")
+        finally:
+            release.write_text("go")
+            proc.wait(timeout=10)
+        # 持有者干净释放后，才轮得到我们
+        self.assertTrue(self._try_acquire(5.0), "持有者释放后仍拿不到锁")
+
+    def test_acquire_after_holder_hard_killed(self):
+        # 场景②：强制终止（SIGKILL/TerminateProcess）持有者后，其他进程能取锁。
+        proc, held, release = self._spawn_holder("release")
+        try:
+            self.assertTrue(self._wait_file(held), "子进程没能拿到锁")
+            self.assertFalse(self._try_acquire(0.2), "被杀之前就不该拿到")
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+        self.assertTrue(self._try_acquire(5.0),
+                        "持有者被强杀、内核该释放锁了，却仍拿不到")
+
+    def test_waiter_timeout_does_not_disturb_holder(self):
+        # 场景③：等待者超时，现有持有者不受影响（不被夺、锁文件不被删）。
+        proc, held, release = self._spawn_holder("release")
+        try:
+            self.assertTrue(self._wait_file(held), "子进程没能拿到锁")
+            self.assertFalse(self._try_acquire(0.3), "等待者不该拿到活持有者的锁")
+            # 等待者超时之后：持有者仍持有（再试一次仍超时），锁文件仍在。
+            self.assertFalse(self._try_acquire(0.3), "等待者超时后持有者被夺走了")
+            self.assertTrue(self.target.with_name("state.json.lock").exists(),
+                            "等待者把持有者的锁文件删了")
+        finally:
+            release.write_text("go")
+            proc.wait(timeout=10)
+        self.assertTrue(self._try_acquire(5.0), "持有者干净释放后仍拿不到锁")
+
+    def test_reacquire_after_abnormal_exit(self):
+        # 场景④：持有者异常退出（跳过 __exit__），后来者能重新取锁；锁文件仍在
+        #（收编 test_previous_owner_cannot_unlink_successors_lock 的业务结果）。
+        proc, held, release = self._spawn_holder("hardexit")
+        self.assertTrue(self._wait_file(held), "子进程没能拿到锁")
+        release.write_text("go")           # 触发它 os._exit(1)
+        proc.wait(timeout=10)
+        self.assertNotEqual(proc.returncode, 0, "本场景要的是异常退出")
+        self.assertTrue(self.target.with_name("state.json.lock").exists(),
+                        "异常退出后固定锁文件不该消失")
+        self.assertTrue(self._try_acquire(5.0), "前持有者异常退出后仍取不到锁")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import random
@@ -26,6 +27,17 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable
+
+# 跨进程锁的平台原语：Unix 用 fcntl.flock、Windows 用 msvcrt.locking。
+# 两个各平台只有一个能 import 成功，缺一不报错——由 `_CrossProcessLock` 按可用性分派。
+try:                       # Unix / macOS / WSL
+    import fcntl as _fcntl
+except ImportError:        # 原生 Windows
+    _fcntl = None          # type: ignore[assignment]
+try:                       # 原生 Windows
+    import msvcrt as _msvcrt
+except ImportError:        # Unix
+    _msvcrt = None         # type: ignore[assignment]
 
 STICKER_EXTS = (".webp", ".tgs", ".webm")
 STICKER_MAX_BYTES = 10 * 1024 * 1024   # 贴纸不该有 10MB，超了多半拿错了文件
@@ -78,67 +90,114 @@ def _looks_file_id_400(exc: ApiRejected) -> bool:
 # 「读—改—写丢失更新」——A、B 先后读到同一份旧库，各自 append 一条再写回，
 # 后写的把先写的整条覆盖（B1）。这里加一把**跨进程**锁把整段事务罩住。
 #
-# 为什么不是 fcntl.flock：贴纸车道承诺全平台（README），flock 只在 Unix 有。
-# O_CREAT|O_EXCL 创建锁文件在 Windows/Unix 都支持、只用标准库：创建成功＝拿到锁，
-# 失败＝有人持有，自旋等。进程崩溃留下的死锁按 mtime 判超龄后夺回
-# （宁可偶尔多等一次，也不让一个崩掉的进程把库永久锁死）。
-_LOCK_STALE_SECONDS = 30.0     # 锁文件比这还旧 ⇒ 多半是崩掉的进程留下的死锁，夺回
+# 用**系统锁**（Unix flock / Windows msvcrt.locking），不用「O_EXCL 建锁文件 +
+# mtime 超龄夺回」的租约方案。租约方案的病灶（R3）：mtime 老了不证明持有者死了
+# ——活进程被暂停/慢盘/系统挂起超过阈值后照样醒来继续写，于是两个持有者同时进
+# 临界区；而且旧持有者退出时无条件 unlink 会把接替者刚建的锁一并删掉。系统锁
+# 由内核随**打开的句柄**记账：句柄关闭（进程正常退出、崩溃、被 kill）内核自动
+# 释放，无需靠时间猜死活，也就不存在「夺错锁」。
+#
+# 锁文件是**固定文件**：`<path>.lock`，O_CREAT|O_RDWR 打开，整个生命周期
+# **既不删除也不替换**（业务 JSON 仍走原子替换，与锁文件是两回事）。取消了所有
+# mtime 过期回收逻辑。
+#
+# 🔴 迁移注意：升级时**旧版写入进程必须全部退出**，新旧两套锁协议不能混跑——
+# 旧版把常驻的锁文件当「超龄死锁」unlink 掉，新版正持着它，互斥就破了；换个锁
+# 文件名也没用（旧版仍会去建/删它认识的那个名字，两拨人各锁各的照样并发写）。
+#
+# ⚠️ Linux flock 的句柄若被 fork 出的子进程继承，父进程即使死了、只要子进程还
+# 攥着那个继承来的句柄，锁就仍被持有。故**持锁期间不要创建会继承该句柄的子进程**
+# （本模块持锁段是纯本地文件读写，不 fork）。
 _LOCK_SPIN_SECONDS = 0.02      # 抢不到时每次自旋歇多久
 _LOCK_WAIT_SECONDS = 10.0      # 抢锁总超时——真抢不到就抛，别无限期挂住调用方
 
 
 class _CrossProcessLock:
-    """给某个状态文件配一把 `<path>.lock` 跨进程互斥锁（上下文管理器）。
+    """给某个状态文件配一把固定 `<path>.lock` 的系统互斥锁（上下文管理器）。
 
     不同文件用不同锁；嵌套只在「库锁内再拿缓存锁」这一种固定顺序发生，
     无环故不死锁。抢锁失败会抛 TimeoutError——调用方（import 提交等）据此
     把这次操作当失败报出去，好过静默丢数据。
+
+    两端统一「非阻塞尝试 + 有界等待」：Unix `flock(LOCK_EX|LOCK_NB)`、Windows
+    `msvcrt.locking(LK_NBLCK)`，用 `time.monotonic()` 管截止时间（不用 Windows
+    的 `LK_LOCK`——那个自带每秒重试最多十次，不受我们的超时管辖）。只有明确的
+    锁竞争错误才继续等，其它错误直接上抛；抢不到锁绝不继续写。
     """
 
     def __init__(self, target: Path) -> None:
         self.lock_path = target.with_name(target.name + ".lock")
         self._fd: int | None = None
 
-    def __enter__(self) -> "_CrossProcessLock":
-        deadline = time.time() + _LOCK_WAIT_SECONDS
-        while True:
+    @staticmethod
+    def _try_lock(fd: int) -> bool:
+        """对已打开的句柄做一次**非阻塞**独占加锁。
+
+        拿到 ⇒ True；被别人占（明确的锁竞争 errno）⇒ False；其它 OSError 上抛
+        （抢不到锁不许当没事继续）。
+        """
+        if _fcntl is not None:
             try:
-                self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-                self._fd = os.open(
-                    str(self.lock_path),
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-                try:
-                    os.write(self._fd, f"{os.getpid()} {time.time():.3f}".encode())
-                except OSError:
-                    pass
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                return True
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    return False
+                raise
+        if _msvcrt is not None:
+            # 固定锁第 0 个字节：加/解锁前都 seek 到偏移 0、长度固定 1，不依赖当前
+            # 文件指针。空文件允许锁 EOF 之外区域，不必预写占位字节。
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError as exc:
+                # 竞争：LK_NBLCK 拿不到立刻抛，errno 视运行库为 EDEADLOCK/EACCES/EAGAIN。
+                if exc.errno in (errno.EDEADLOCK, errno.EACCES, errno.EAGAIN):
+                    return False
+                raise
+        # 两个平台原语都没有（不该发生在支持的平台）：退化为无跨进程互斥。
+        return True
+
+    def __enter__(self) -> "_CrossProcessLock":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+        while True:
+            # 每次尝试都用**独立打开**的句柄；只有成功加锁后才留住它，否则立刻关闭，
+            # 绝不泄漏（正常退出、加锁竞争、异常上抛三条路都覆盖）。
+            fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                got = self._try_lock(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            if got:
+                self._fd = fd
                 return self
-            except FileExistsError:
-                # 有人持锁：超龄死锁夺回，否则自旋等到超时
-                try:
-                    if time.time() - self.lock_path.stat().st_mtime > _LOCK_STALE_SECONDS:
-                        os.unlink(str(self.lock_path))
-                        continue
-                except OSError:
-                    pass
-                if time.time() >= deadline:
-                    raise TimeoutError(
-                        f"抢贴纸状态锁超时（{self.lock_path.name}）——"
-                        "有别的进程长时间持锁，这次没入库/没写，稍后重试"
-                    )
-                time.sleep(_LOCK_SPIN_SECONDS)
+            os.close(fd)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"抢贴纸状态锁超时（{self.lock_path.name}）——"
+                    "有别的进程长时间持锁，这次没入库/没写，稍后重试"
+                )
+            time.sleep(_LOCK_SPIN_SECONDS)
 
     def __exit__(self, *exc: Any) -> bool:
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return False       # enter 超时/异常时没有句柄可清，安全空转
         try:
-            if self._fd is not None:
-                os.close(self._fd)
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            elif _msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
         finally:
-            self._fd = None
-            try:
-                os.unlink(str(self.lock_path))
-            except OSError:
-                pass
+            os.close(fd)       # 固定锁文件从不 unlink——见上方类前注释的迁移注意
         return False
 
 
