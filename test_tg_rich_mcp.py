@@ -1124,6 +1124,28 @@ class PartialSendLedger(unittest.TestCase):
         self.assertTrue(stickers_delivered[0].get("cache_warning"),
                         "缓存写失败应留告警，但送达仍成立")
 
+    def test_all_planned_segments_accounted_for_after_abort(self):
+        # R4（收编审查反例）：first（😺）second（😺）third＝5 段；第 2 段正文被拒收，
+        # 尾部 4、5 段从没试过发——必须进 not_attempted，五段全都有归属，不许凭空消失。
+        count = 0
+
+        def api(method, data, files=None):
+            nonlocal count
+            if method == "sendRichMessage":
+                count += 1
+                if count == 2:
+                    raise mcp.ApiRejected("unsupported format", 400)
+            return {"ok": True, "result": {"message_id": 701}}
+
+        mcp.call_api = api
+        result = call_tool("tg_rich_send", {"markdown": "first（😭）second（😭）third"})
+        ledger = self._ledger(result["result"]["content"][0]["text"])
+        actual = {item["seg"] for values in ledger.values()
+                  for item in values if isinstance(item, dict)}
+        self.assertEqual(actual, {1, 2, 3, 4, 5}, f"计划段有缺口：{ledger}")
+        self.assertTrue(ledger["not_attempted"], "未遍历的尾段应进 not_attempted")
+        self.assertEqual({x["seg"] for x in ledger["not_attempted"]}, {4, 5})
+
 
 class DraftCanStop(unittest.TestCase):
     """can_stop / keep_on_stop 透传：开了才带，没开一个字节都不多发。"""

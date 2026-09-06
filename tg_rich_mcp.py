@@ -435,16 +435,27 @@ def _ledger_text(
     failed: list[dict[str, Any]],
     unknown: list[dict[str, Any]],
     aborted: str | None = None,
+    not_attempted: list[dict[str, Any]] | None = None,
 ) -> str:
-    """人类可读文案 + 机器可读分段送达账（坑 17 的记账落在这儿）。"""
-    ledger = {"delivered": delivered, "failed": failed, "unknown": unknown}
+    """人类可读文案 + 机器可读分段送达账（坑 17 的记账落在这儿）。
+
+    四个桶保证**每个计划段都有归属**（R4）：delivered/failed/unknown 之外，
+    中断时尚未遍历到的尾段进 not_attempted（从没试过发，与「发了没拿到回执」的
+    unknown 是两回事）。
+    """
+    ledger = {
+        "delivered": delivered, "failed": failed,
+        "unknown": unknown, "not_attempted": not_attempted or [],
+    }
     body = "\n  ".join(lines)
     if aborted:
         human = (
             "分段发送中途失败——已送达的段记录在下面且**保留**，"
             f"整条禁止重试（会把已送达的段发重）。中断：{aborted}\n  " + body
             + "\n⚠️ unknown 段可能已被 Telegram 收到（超时/网络错，送达状态未知），"
-            "不得当成没发出去自动补发；要补只补 unknown/failed 里点名的那几段。"
+            "不得当成没发出去自动补发；要补只补 failed/not_attempted 里点名的那几段"
+            "（unknown 段先确认送达再说）。not_attempted＝根本没试过发的尾段，"
+            "接着从它们发下去即可。"
         )
     else:
         human = ("已按标记位置分段送达：\n  " + body
@@ -480,12 +491,23 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
     delivered: list[dict[str, Any]] = []   # 已确认送达（带 message_id）
     failed: list[dict[str, Any]] = []      # 明确没送出去（贴纸拒收 / 孤儿挂起 / 服务器拒收 / 本地预检）
     unknown: list[dict[str, Any]] = []     # 送达状态未知（超时/网络错，禁止当没发自动补发）
+    not_attempted: list[dict[str, Any]] = []   # 中断时尚未遍历到的尾段（从没试过发）
     has_text = any(k == "text" for k, _ in plan)
     text_delivered = False
     held: list[tuple[int, Any]] = []       # 正文落地前挂起的贴纸段（带段号）
 
     silent = bool(args.get("silent"))
     is_rtl = bool(args.get("rtl"))
+
+    def _seg_stub(seg: int, kind: str, payload: Any) -> dict[str, Any]:
+        """给某个计划段生成一条账目骨架（not_attempted 用，供调用方定位/接续）。"""
+        stub: dict[str, Any] = {"seg": seg, "kind": kind}
+        if kind == "sticker":
+            stub["marker"] = payload[2]
+        else:
+            preview = str(payload or "")
+            stub["text_preview"] = preview[:40] + ("…" if len(preview) > 40 else "")
+        return stub
 
     def _fire(seg: int, payload: Any) -> None:
         # 贴纸段：结构化回执三态与文字段一套口径（R2）——服务器拒收/本地预检 → failed，
@@ -524,8 +546,14 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
         for hseg, hp in held:   # 中断时挂起的脸永不发送，记一笔"没发"
             failed.append({"seg": hseg, "kind": "sticker", "marker": hp[2],
                            "error": "前段正文未送达，孤儿防护未发"})
+        # 尚未遍历到的尾段（seg 号在当前之后）：从没试过发 → not_attempted（R4）。
+        # held 里的脸段号都在当前之前，与这里不重叠；每个计划段因此都有归属。
+        for idx, (kind, payload) in enumerate(plan, 1):
+            if idx > seg:
+                not_attempted.append(_seg_stub(idx, kind, payload))
         raise PartialSendError(
-            _ledger_text(lines, delivered, failed, unknown, aborted=str(exc))
+            _ledger_text(lines, delivered, failed, unknown,
+                         aborted=str(exc), not_attempted=not_attempted)
         ) from None
 
     for seg, (kind, payload) in enumerate(plan, 1):
