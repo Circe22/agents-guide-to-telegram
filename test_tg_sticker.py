@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -549,6 +550,78 @@ class TestHookScan(Base):
     def test_never_raises_on_garbage(self):
         for garbage in ("", "<channel", "attachment_kind=\"sticker\"", "純文字"):
             tg_sticker_hook.scan(garbage)   # 不炸即过
+
+
+# ---------- R1：并发导入同一 unique，归档不许拷进被截断的 pending ----------
+class TestSameStickerTruncation(Base):
+    """R1（收编审查反例）：两个调用同时导入同一张贴纸时，B 把共享 pending 文件
+    `open('wb')` 截断为零字节的窗口内，A 正好提交归档——归档必须仍是完整原图，
+    不能拷到 B 截断出来的空文件。
+
+    业务结果：两个调用都成功、库里一条记录、且**归档字节 == 下载到的原图**。
+    反向变异：把 `tool_sticker_import` 提交段的 `_atomic_write_bytes(final, blob)`
+    换回 `final.write_bytes(archive.read_bytes())`（回头读共享 pending），此测试
+    必转红（归档变成 b''）。
+    """
+
+    def test_archive_not_copied_from_truncated_pending(self):
+        tg_sticker.save_library([])
+        a_has_lock, b_truncated, a_done = (threading.Event() for _ in range(3))
+        original_enter = tg_sticker._CrossProcessLock.__enter__
+        original_write = Path.write_bytes
+        results, errors = [], []
+
+        def enter(lock):
+            value = original_enter(lock)
+            if (threading.current_thread().name == "A"
+                    and lock.lock_path.name == "library.json.lock"):
+                a_has_lock.set()
+                if not b_truncated.wait(3):
+                    raise RuntimeError("B never opened pending file")
+            return value
+
+        def write(path, content):
+            if (threading.current_thread().name == "B"
+                    and path.name == "SAME.webp" and path.parent.name == "pending"):
+                with path.open("wb") as out:   # 正常 write_bytes 就是先在这里截断
+                    b_truncated.set()
+                    if not a_done.wait(3):
+                        raise RuntimeError("A never completed")
+                    return out.write(content)
+            return original_write(path, content)
+
+        def api(method, data, files=None):
+            return {"ok": True, "result": {
+                "file_unique_id": "SAME", "file_path": "same.webp", "file_size": 18}}
+
+        def worker(label):
+            try:
+                results.append(tg_sticker.tool_sticker_import(
+                    {"file_id": label, "title": label, "emoji": "😺"},
+                    TOKEN, api, lambda remote: b"VALID_STICKER_BYTES"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+            finally:
+                if label == "A":
+                    a_done.set()
+
+        with mock.patch.object(tg_sticker._CrossProcessLock, "__enter__", enter), \
+                mock.patch.object(Path, "write_bytes", write):
+            a = threading.Thread(target=worker, args=("A",), name="A")
+            b = threading.Thread(target=worker, args=("B",), name="B")
+            a.start()
+            self.assertTrue(a_has_lock.wait(2))
+            b.start()
+            a.join(5)
+            b.join(5)
+
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(results), 2)
+        lib = tg_sticker.load_library()
+        self.assertEqual(len(lib), 1)
+        archived = (tg_sticker.sticker_dir() / lib[0]["file"]).read_bytes()
+        self.assertEqual(archived, b"VALID_STICKER_BYTES",
+                         f"归档在 pending 被截断时拷了空内容：{archived!r}")
 
 
 # ---------- R3：系统锁的活性/互斥（同进程 fcntl 版，非 fcntl 平台跳过） ----------

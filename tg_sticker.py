@@ -278,6 +278,30 @@ def _write_json(path: Path, data: Any, mode: int = 0o600) -> None:
     tmp.replace(path)
 
 
+def _atomic_write_bytes(path: Path, blob: bytes, mode: int = 0o644) -> None:
+    """把 blob 原子发布到 path：**每次调用自己的临时文件**（带 pid+随机后缀）写满
+    再 `os.replace` 顶上去。
+
+    两个作用（R1）：① 读侧永远看到「旧的完整文件」或「新的完整文件」，绝不会读到
+    写了一半/被截断的中间态；② 临时文件名各调用互不相同，并发导入同一 unique 时
+    谁也截不断谁的临时文件，清理时也只删自己那份。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{random.randrange(1 << 32):08x}.tmp")
+    try:
+        tmp.write_bytes(blob)
+        try:
+            tmp.chmod(mode)
+        except OSError:
+            pass
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            tmp.unlink()      # os.replace 成功后 tmp 已不在；异常路径下清掉自己的临时文件
+        except OSError:
+            pass
+
+
 def load_library() -> list[dict[str, Any]]:
     data = _read_json(sticker_dir() / "library.json", {})
     stickers = data.get("stickers") if isinstance(data, dict) else None
@@ -539,12 +563,16 @@ def tool_sticker_import(args: dict[str, Any], token: str,
             raise ValueError(
                 f"待认领区里没有 {unique_arg}。新贴纸请带 file_id 来（我去下载归档）。")
 
+    # blob＝本次导入**自己持有的**原图字节（内存里的）。提交归档时从它写，绝不在
+    # 锁内回头去读某个共享 pending 文件——那个文件另一个并发导入随时能截断（R1）。
     if pending_record:
         unique = unique_arg
         archive = Path(str(pending_record.get("file") or ""))
         file_id = str(pending_record.get("file_id") or "")
         if not archive.is_file():
             raise RuntimeError("待认领记录在、原图不在了——带 file_id 重新导一次")
+        ext = archive.suffix.lower()
+        blob = archive.read_bytes()   # 认领路径：把原图一次性读进内存，之后只认 blob
     else:
         if not file_id:
             raise ValueError("要么给新贴纸的 file_id，要么给待认领区里的 file_unique_id")
@@ -554,6 +582,8 @@ def tool_sticker_import(args: dict[str, Any], token: str,
             remember_file_id(token, unique, file_id)
             return (f"认识：馆藏 {existing.get('id')} 号「{existing.get('title')}」"
                     f"{existing.get('emoji')}（file_id 已更新进本 bot 缓存）。")
+        # 下载落地一份 pending 面包屑（崩在提交前也不丢下载/可被后续认领）；
+        # 但它**不**再作为归档的来源，归档只认上面的内存 blob。
         _pending_dir().mkdir(parents=True, exist_ok=True)
         archive = _pending_dir() / f"{unique}{ext}"
         archive.write_bytes(blob)
@@ -592,8 +622,10 @@ def tool_sticker_import(args: dict[str, Any], token: str,
             img_dir.mkdir(parents=True, exist_ok=True)
             # 原图按 file_unique_id（跨 bot 恒定的稳定身份）命名，不按会撞车的顺序号：
             # 万一锁失灵，稳定名也让两张不同的贴纸落到不同文件、不互相覆盖。
-            final = img_dir / f"{unique}{archive.suffix.lower()}"
-            final.write_bytes(archive.read_bytes())
+            # 从内存 blob 原子发布（R1）：不 `archive.read_bytes()`——共享 pending 文件
+            # 此刻可能正被另一个并发导入 `open('wb')` 截断成零字节，读到就归档空文件。
+            final = img_dir / f"{unique}{ext}"
+            _atomic_write_bytes(final, blob)
             entry = {
                 "id": new_id,
                 "title": title,
