@@ -313,6 +313,19 @@ def _looks_message_gone(exc: Exception) -> bool:
     return any(sign in text for sign in _MESSAGE_GONE_SIGNS)
 
 
+def _superseded(state: dict, seq: int) -> bool:
+    """这一帧是否被更新的**已调度**推送顶替了？
+
+    只认真派出过子进程的 seq（`sched_seq`）——被 1.2 秒节流、没派出子进程的新事件
+    只推高了 `seq`，不能让唯一一个在飞的投递任务据此让位、最终零编辑（B6）。
+    `sched_seq` 未设时回落到 `seq`（手工播种的老用例按原语义走）。
+    """
+    if not seq:
+        return False
+    sched = int(state.get("sched_seq") or state.get("seq") or 0)
+    return seq < sched
+
+
 def _blocks(lines: list[str], total: int, done: bool = False,
             draft: bool = False) -> list[dict]:
     # total 必须单独记：lines 只留最近 40 条，拿 len(lines) 当步数的话，
@@ -370,8 +383,9 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
         gen = int(state.get("gen") or 0)   # 这一帧属于哪一代，登记时要对得上
 
         if _mode() == "draft":
-            # 锁内重读之后再比 seq：已经有更新的帧了就让位，反正它马上到。
-            if seq and int(state.get("seq") or 0) != seq:
+            # 锁内重读之后再判：被更新的**已调度**帧顶替了才让位（那帧的子进程真在飞）。
+            # 只被节流推高 seq、没派子进程的，不能让唯一在飞的投递任务让位（B6）。
+            if _superseded(state, seq):
                 return 0
             tool_draft({
                 "draft_id": int(state.get("draft_id") or 0),
@@ -420,7 +434,7 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
                         pass
             return 0
 
-        if seq and int(state.get("seq") or 0) != seq:
+        if _superseded(state, seq):
             return 0
         try:
             call_api("editMessageText", {
@@ -585,6 +599,9 @@ def main() -> int:
             due = now - float(state.get("last_push") or 0) >= MIN_INTERVAL
             if due:
                 state["last_push"] = now
+                # 记下"真被调度出去的那个 seq"：只有它能让更旧的在飞帧让位。
+                # 被节流没派子进程的事件只推高 seq、不动 sched_seq（B6）。
+                state["sched_seq"] = state["seq"]
                 # 持久窗要先有一条消息才能改。派活给这一帧，超时未果再改派。
                 if not int(state.get("msg_id") or 0) and (
                         not state.get("claim")

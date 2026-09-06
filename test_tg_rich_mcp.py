@@ -507,6 +507,66 @@ class EditErrorClassification(unittest.TestCase):
         self.assertEqual(self._msg_id(path), 42, "无关 400 不该弃窗")
 
 
+@needs_hook
+class ThrottledTailFrame(unittest.TestCase):
+    """B6：被节流（没派出子进程）的事件不许让唯一在飞的推送任务失效。
+
+    窗口已存在时 t=1000 的事件派出推送子进程；t=1000.1 又来一次事件，因 1.2s
+    节流没派新子进程、只推高了 seq。那个唯一子进程真跑起来时必须照发最新内容，
+    不能因为 seq 变了就让位给一个根本不存在的调度任务（结果零编辑）。
+
+    反向变异：把 _superseded 换回 `int(state.get("seq") or 0) != seq`，
+    test_only_pending_push_still_edits 必转红（0 次编辑）。
+    """
+
+    def setUp(self):
+        import time as _t
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_dir = hook.STATE_DIR
+        hook.STATE_DIR = Path(self.tmp.name)
+        self.had = {k: os.environ.get(k) for k in ("TG_CHAT_ID", "TG_PROGRESS")}
+        os.environ["TG_CHAT_ID"] = "888"
+        os.environ["TG_PROGRESS"] = "1"
+        self.original = mcp.call_api
+        path = hook._state_path("s6")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"seq": 1, "gen": 0, "msg_id": 42,
+                                    "lines": ["⚡ Bash"], "total": 1,
+                                    "last_push": 998.0, "draft_id": 9}),
+                        encoding="utf-8")
+        self.path = path
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        hook.STATE_DIR = self.old_dir
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def test_only_pending_push_still_edits(self):
+        import io
+        event = json.dumps({"session_id": "s6", "tool_name": "Read",
+                            "tool_input": {"file_path": "/tmp/x.py"}})
+        from unittest.mock import patch
+        with patch.object(hook.subprocess, "Popen") as spawn, \
+                patch.object(sys, "argv", ["tg_progress_hook.py"]):
+            for stamp in (1000.0, 1000.1):
+                with patch.object(hook.time, "time", return_value=stamp), \
+                        patch.object(sys, "stdin", io.StringIO(event)):
+                    hook.main()
+            self.assertEqual(spawn.call_count, 1, "第二帧被节流，不该再派子进程")
+            scheduled_seq = int(spawn.call_args.args[0][-1])
+
+        edits = []
+        mcp.call_api = lambda *a, **k: (edits.append(a[0]), {"result": {}})[1]
+        hook._push(self.path, scheduled_seq)
+        self.assertEqual(edits, ["editMessageText"],
+                         "唯一在飞的推送被没有子进程的新事件顶掉了，零编辑")
+
+
 class MediaUpload(unittest.TestCase):
     """media_paths → multipart。坏了＝要么发不出图，要么把凭证文件当图发出去。"""
 
