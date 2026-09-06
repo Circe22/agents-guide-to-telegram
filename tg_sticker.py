@@ -418,34 +418,114 @@ def _archive_file(entry: dict[str, Any]) -> Path:
     return real
 
 
-def send_entry(entry: dict[str, Any], chat_id: str, token: str,
-               api: Callable[..., dict[str, Any]], silent: bool = False) -> str:
-    """v3 懒迁移：本 bot 缓存 → 400 才重传归档原图 → 新 file_id 写回缓存。
+class StickerReceipt:
+    """一次贴纸发送的**结构化回执**（R2）。
 
-    `silent`＝静默发送：与分段正文共享同一个发送选项，别让"命中贴纸分支"把
-    disable_notification 丢掉（B7）。
+    `status` 三态，与文字段一套口径：
+      - `"delivered"`：服务器已确认收下（带 `message_id`）。**发送后的缓存维护
+        失败不推翻它**——记 delivered，另挂 `cache_warning`（下次可能再上传一遍，
+        但这条已经送到了，绝不能误报成没发）。
+      - `"failed"`：服务器**明确拒收**（ApiRejected/ok:false），或发送前的本地问题
+        （归档不在库/格式不对/原图丢失）——肯定没发出去，可安全补这一段。
+      - `"unknown"`：**网络错/超时**（请求可能已到 Telegram），送达状态未知，
+        禁止当没发出去自动补发。
+
+    `exc` 留着原始异常，好让向后兼容的 `send_entry()` 包装层把**原类型**照原样抛出去。
     """
+
+    def __init__(self, status: str, note: str, *, message_id: int | None = None,
+                 cache_warning: str | None = None, error: str | None = None,
+                 exc: BaseException | None = None) -> None:
+        self.status = status
+        self.note = note
+        self.message_id = message_id
+        self.cache_warning = cache_warning
+        self.error = error
+        self.exc = exc
+
+
+def _sticker_mid(payload: dict[str, Any]) -> int | None:
+    result = payload.get("result") if isinstance(payload, dict) else None
+    mid = result.get("message_id") if isinstance(result, dict) else None
+    return mid if isinstance(mid, int) else None
+
+
+def send_entry_receipt(entry: dict[str, Any], chat_id: str, token: str,
+                       api: Callable[..., dict[str, Any]],
+                       silent: bool = False) -> StickerReceipt:
+    """v3 懒迁移，返回**结构化回执**（不为发送结果抛异常，全部落进 status）。
+
+    区分四个阶段：本地预检（failed）、服务器拒收（failed）、网络未知（unknown）、
+    发送成功后的缓存维护（delivered，缓存失败只挂告警）。`silent` 与分段正文共享
+    同一发送选项，别让"命中贴纸分支"把 disable_notification 丢掉（B7）。
+    """
+    title, emj = entry.get("title"), entry.get("emoji")
     unique = str(entry.get("file_unique_id") or "")
     quiet = {"disable_notification": "true"} if silent else {}
     cached = load_cache(token).get(unique) if unique else None
     if cached:
         try:
-            api("sendSticker", {"chat_id": chat_id, "sticker": cached, **quiet})
-            return f"贴纸已发：{entry.get('title')}（{entry.get('emoji')}）"
+            payload = api("sendSticker", {"chat_id": chat_id, "sticker": cached, **quiet})
         except ApiRejected as exc:
             if not _looks_file_id_400(exc):
-                raise      # 非 400，或 400 但不关 file_id 的事（chat 错/参数错）
-            # 文案点名 file_id 失效（换过 token 等），才走归档重传
-    real = _archive_file(entry)
-    payload = api("sendSticker", {"chat_id": chat_id, **quiet},
-                  files={"sticker": (real.name, real.read_bytes())})
+                # 非 400，或 400 但不关 file_id 的事（chat 错/参数错）＝服务器拒收
+                return StickerReceipt("failed", f"贴纸未送达（服务器拒收）：{title}（{emj}）",
+                                      error=str(exc), exc=exc)
+            # 文案点名 file_id 失效（换过 token 等），才走归档重传（往下走）
+        except (RuntimeError, OSError) as exc:
+            return StickerReceipt("unknown", f"贴纸送达状态未知（网络错）：{title}（{emj}）",
+                                  error=str(exc), exc=exc)
+        else:
+            return StickerReceipt("delivered", f"贴纸已发：{title}（{emj}）",
+                                  message_id=_sticker_mid(payload))
+    # ---- 归档重传：本地预检 → 上传 → 缓存新 file_id ----
+    try:
+        real = _archive_file(entry)
+        blob = real.read_bytes()
+    except (RuntimeError, OSError) as exc:
+        # 发送前的本地问题（归档不在库/格式不对/原图丢失）＝一个字节都没出门 → failed
+        return StickerReceipt("failed", f"贴纸未送达（归档不可用）：{title}（{emj}）",
+                              error=str(exc), exc=exc)
+    try:
+        payload = api("sendSticker", {"chat_id": chat_id, **quiet},
+                      files={"sticker": (real.name, blob)})
+    except ApiRejected as exc:
+        return StickerReceipt("failed", f"贴纸未送达（服务器拒收）：{title}（{emj}）",
+                              error=str(exc), exc=exc)
+    except (RuntimeError, OSError) as exc:
+        return StickerReceipt("unknown", f"贴纸送达状态未知（网络错）：{title}（{emj}）",
+                              error=str(exc), exc=exc)
+    # 到这儿服务器已收下——从此**不许**再把它降级成失败/未知。
     result = payload.get("result") or {}
     fresh = ((result.get("sticker") or {}).get("file_id")
              if isinstance(result, dict) else None)
+    cache_warning = None
     if unique and fresh:
-        remember_file_id(token, unique, str(fresh))
-    return (f"贴纸已发：{entry.get('title')}（{entry.get('emoji')}）"
-            "（本 bot 首次用这张，已从归档上传并缓存 file_id）")
+        try:
+            remember_file_id(token, unique, str(fresh))
+        except OSError as exc:
+            # 缓存写盘失败（磁盘满等）：已送达不受影响，只是下次可能再上传一遍。
+            cache_warning = f"file_id 缓存写入失败（{exc}）——本次已送达，下次可能再从归档上传一遍"
+    note = f"贴纸已发：{title}（{emj}）（本 bot 首次用这张，已从归档上传并缓存 file_id）"
+    if cache_warning:
+        note += f"\n⚠️ {cache_warning}"
+    return StickerReceipt("delivered", note,
+                          message_id=_sticker_mid(payload), cache_warning=cache_warning)
+
+
+def send_entry(entry: dict[str, Any], chat_id: str, token: str,
+               api: Callable[..., dict[str, Any]], silent: bool = False) -> str:
+    """向后兼容包装：成功返回人话 note，失败照原异常类型抛出。
+
+    独立工具 `tg_sticker_send` 仍按「成功给文案、失败抛异常」的老合同用它；
+    分段路径（`_send_with_stickers`）改用 `send_entry_receipt` 拿结构化状态。
+    """
+    receipt = send_entry_receipt(entry, chat_id, token, api, silent=silent)
+    if receipt.status == "delivered":
+        return receipt.note
+    if receipt.exc is not None:
+        raise receipt.exc
+    raise RuntimeError(receipt.error or receipt.note)
 
 
 # ---------- 工具：tg_sticker_send ----------

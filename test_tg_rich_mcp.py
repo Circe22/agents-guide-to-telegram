@@ -23,6 +23,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -907,11 +908,17 @@ class OrphanStickerGuard(unittest.TestCase):
                          ["sendRichMessage", "sendSticker", "sendRichMessage"])
 
     def test_sticker_failure_still_spares_the_text(self):
-        # 反过来不变：脸发失败不牵连正文（坑 17 的老纪律，v4 一个字没动）
+        # 反过来不变：脸发失败不牵连正文（坑 17 的老纪律）。
+        # R2：fake 的 sendSticker 抛的是**普通 RuntimeError（网络式）**，按文字/贴纸
+        # 一套口径应归 unknown（可能已送达、禁止自动补发），不是 failed；无论哪种，
+        # 两条正文都照常送出去（脸的成败不牵连话）。
         self.fail_on = "sendSticker"
         out = mcp.tool_send({"markdown": "第一句（😭）第二句"})
         self.assertEqual(self.methods().count("sendRichMessage"), 2)
-        self.assertIn("贴纸未送达", out)
+        self.assertIn("贴纸送达状态未知", out)
+        ledger = json.loads(out.split("分段送达账（机器可读）：", 1)[1])
+        self.assertTrue(any(x["kind"] == "sticker" for x in ledger["unknown"]))
+        self.assertEqual(ledger["failed"], [], "网络式错误不该记成服务器拒收")
 
     def test_reply_to_lands_on_first_delivered_text(self):
         # 句首贴纸被挂起后，引用回复应该落在第一条真送出去的正文上
@@ -1073,6 +1080,49 @@ class PartialSendLedger(unittest.TestCase):
         self.assertEqual(kinds, ["text", "sticker", "text"])
         self.assertEqual(ledger["failed"], [])
         self.assertEqual(ledger["unknown"], [])
+
+    def test_sticker_timeout_is_unknown_not_safe_to_retry(self):
+        # R2（收编审查反例）：sendSticker 抛网络式 RuntimeError（请求可能已到）＝
+        # 送达状态未知，进 unknown，绝不进 failed（failed 会被调用方当「肯定没发」
+        # 安全补发 → 重复贴纸）。
+        def api(method, data, files=None):
+            if method == "sendSticker":
+                raise RuntimeError("lost response after sending request")
+            return {"ok": True, "result": {"message_id": 701}}
+
+        mcp.call_api = api
+        ledger = self._ledger(mcp.tool_send({"markdown": "hello（😭）"}))
+        self.assertTrue(any(x["kind"] == "sticker" for x in ledger["unknown"]), ledger)
+        self.assertFalse(any(x["kind"] == "sticker" for x in ledger["failed"]), ledger)
+
+    def test_successful_sticker_with_failed_cache_is_delivered(self):
+        # R2（收编审查反例）：sendSticker 已返回成功，随后 remember_file_id 因磁盘满
+        # 失败——贴纸已经送达，必须记 delivered + 缓存告警，绝不误报成 failed。
+        import tg_sticker
+        # 归档原图要在（走归档重传路径），且缓存为空以强制走上传分支
+        img = Path(self.tmp.name) / "img" / "002.webp"
+        img.parent.mkdir(parents=True, exist_ok=True)
+        img.write_bytes(b"fake-image")
+        actual_delivery = []
+
+        def api(method, data, files=None):
+            if method == "sendSticker":
+                actual_delivery.append(778)
+                return {"ok": True, "result": {"message_id": 778,
+                                               "sticker": {"file_id": "FRESH"}}}
+            return {"ok": True, "result": {"message_id": 701}}
+
+        mcp.call_api = api
+        with mock.patch.object(tg_sticker, "load_cache", return_value={}), \
+                mock.patch.object(tg_sticker, "remember_file_id",
+                                  side_effect=OSError("disk full")):
+            ledger = self._ledger(mcp.tool_send({"markdown": "hello（😭）"}))
+        self.assertEqual(actual_delivery, [778])
+        stickers_delivered = [x for x in ledger["delivered"] if x["kind"] == "sticker"]
+        self.assertTrue(stickers_delivered, ledger)
+        self.assertEqual(stickers_delivered[0].get("message_id"), 778)
+        self.assertTrue(stickers_delivered[0].get("cache_warning"),
+                        "缓存写失败应留告警，但送达仍成立")
 
 
 class DraftCanStop(unittest.TestCase):

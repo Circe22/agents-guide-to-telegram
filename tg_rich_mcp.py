@@ -478,7 +478,7 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
 
     lines: list[str] = []
     delivered: list[dict[str, Any]] = []   # 已确认送达（带 message_id）
-    failed: list[dict[str, Any]] = []      # 明确没送出去（贴纸失败 / 孤儿挂起 / 服务器拒收）
+    failed: list[dict[str, Any]] = []      # 明确没送出去（贴纸拒收 / 孤儿挂起 / 服务器拒收 / 本地预检）
     unknown: list[dict[str, Any]] = []     # 送达状态未知（超时/网络错，禁止当没发自动补发）
     has_text = any(k == "text" for k, _ in plan)
     text_delivered = False
@@ -488,18 +488,36 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
     is_rtl = bool(args.get("rtl"))
 
     def _fire(seg: int, payload: Any) -> None:
+        # 贴纸段：结构化回执三态与文字段一套口径（R2）——服务器拒收/本地预检 → failed，
+        # 网络错/超时 → unknown（可能已送达，禁止自动补发），成功 → delivered（发送后的
+        # 缓存维护失败不推翻送达，只挂告警）。脸发失败**永不牵连**已送达的正文。
         pool, combo, raw = payload
         try:
             entry = tg_sticker.pick(pool, combo)
-            # 贴纸与分段正文共享发送选项：silent 也要传给 sendSticker（B7）
-            tg_sticker.send_entry(entry, chat, token, call_api, silent=silent)
-            lines.append(f"贴纸「{entry.get('title')}」← 标记 {raw}")
-            delivered.append({"seg": seg, "kind": "sticker",
-                              "title": str(entry.get("title") or ""), "marker": raw})
-        except (RuntimeError, ValueError, OSError) as exc:
-            lines.append(f"贴纸未送达 ← 标记 {raw}（{exc}）")
-            failed.append({"seg": seg, "kind": "sticker", "marker": raw,
-                           "error": str(exc)})
+        except Exception as exc:   # 挑选阶段（拿锁等）异常＝一个字节都没出门 → failed
+            lines.append(f"贴纸未送达（挑选失败）← 标记 {raw}（{exc}）")
+            failed.append({"seg": seg, "kind": "sticker", "marker": raw, "error": str(exc)})
+            return
+        receipt = tg_sticker.send_entry_receipt(entry, chat, token, call_api, silent=silent)
+        title = str(entry.get("title") or "")
+        rec: dict[str, Any] = {"seg": seg, "kind": "sticker", "title": title, "marker": raw}
+        if receipt.status == "delivered":
+            if receipt.message_id is not None:
+                rec["message_id"] = receipt.message_id
+            if receipt.cache_warning:
+                rec["cache_warning"] = receipt.cache_warning
+                lines.append(f"贴纸「{title}」← 标记 {raw}（⚠️ 缓存告警：{receipt.cache_warning}）")
+            else:
+                lines.append(f"贴纸「{title}」← 标记 {raw}")
+            delivered.append(rec)
+        elif receipt.status == "unknown":
+            rec["error"] = receipt.error
+            lines.append(f"贴纸送达状态未知 ← 标记 {raw}（{receipt.error}）")
+            unknown.append(rec)
+        else:   # failed（服务器拒收 / 本地预检）
+            rec["error"] = receipt.error
+            lines.append(f"贴纸未送达 ← 标记 {raw}（{receipt.error}）")
+            failed.append(rec)
 
     def _abort(seg: int, exc: Exception, bucket: list[dict[str, Any]]) -> None:
         bucket.append({"seg": seg, "kind": "text", "error": str(exc)})
