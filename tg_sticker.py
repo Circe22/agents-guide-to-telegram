@@ -22,6 +22,7 @@ import json
 import os
 import random
 import re
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable
@@ -69,6 +70,76 @@ def _looks_file_id_400(exc: ApiRejected) -> bool:
         return False
     text = str(exc).lower()
     return any(sign in text for sign in _FILE_ID_400_SIGNS)
+
+
+# ---------- 跨进程互斥（贴纸库 / 缓存 / 避重状态的读—改—写）----------
+# 库目录默认是**共享的**：多个会话、多只 bot 的 MCP 进程会同时读—改—写同一份
+# library.json / file-ids.*.json / state.json。原子替换只挡「半截 JSON」，挡不住
+# 「读—改—写丢失更新」——A、B 先后读到同一份旧库，各自 append 一条再写回，
+# 后写的把先写的整条覆盖（B1）。这里加一把**跨进程**锁把整段事务罩住。
+#
+# 为什么不是 fcntl.flock：贴纸车道承诺全平台（README），flock 只在 Unix 有。
+# O_CREAT|O_EXCL 创建锁文件在 Windows/Unix 都支持、只用标准库：创建成功＝拿到锁，
+# 失败＝有人持有，自旋等。进程崩溃留下的死锁按 mtime 判超龄后夺回
+# （宁可偶尔多等一次，也不让一个崩掉的进程把库永久锁死）。
+_LOCK_STALE_SECONDS = 30.0     # 锁文件比这还旧 ⇒ 多半是崩掉的进程留下的死锁，夺回
+_LOCK_SPIN_SECONDS = 0.02      # 抢不到时每次自旋歇多久
+_LOCK_WAIT_SECONDS = 10.0      # 抢锁总超时——真抢不到就抛，别无限期挂住调用方
+
+
+class _CrossProcessLock:
+    """给某个状态文件配一把 `<path>.lock` 跨进程互斥锁（上下文管理器）。
+
+    不同文件用不同锁；嵌套只在「库锁内再拿缓存锁」这一种固定顺序发生，
+    无环故不死锁。抢锁失败会抛 TimeoutError——调用方（import 提交等）据此
+    把这次操作当失败报出去，好过静默丢数据。
+    """
+
+    def __init__(self, target: Path) -> None:
+        self.lock_path = target.with_name(target.name + ".lock")
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_CrossProcessLock":
+        deadline = time.time() + _LOCK_WAIT_SECONDS
+        while True:
+            try:
+                self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+                self._fd = os.open(
+                    str(self.lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                try:
+                    os.write(self._fd, f"{os.getpid()} {time.time():.3f}".encode())
+                except OSError:
+                    pass
+                return self
+            except FileExistsError:
+                # 有人持锁：超龄死锁夺回，否则自旋等到超时
+                try:
+                    if time.time() - self.lock_path.stat().st_mtime > _LOCK_STALE_SECONDS:
+                        os.unlink(str(self.lock_path))
+                        continue
+                except OSError:
+                    pass
+                if time.time() >= deadline:
+                    raise TimeoutError(
+                        f"抢贴纸状态锁超时（{self.lock_path.name}）——"
+                        "有别的进程长时间持锁，这次没入库/没写，稍后重试"
+                    )
+                time.sleep(_LOCK_SPIN_SECONDS)
+
+    def __exit__(self, *exc: Any) -> bool:
+        try:
+            if self._fd is not None:
+                os.close(self._fd)
+        finally:
+            self._fd = None
+            try:
+                os.unlink(str(self.lock_path))
+            except OSError:
+                pass
+        return False
 
 
 # ---------- emoji 处理 ----------
@@ -194,9 +265,13 @@ def load_cache(token: str) -> dict[str, str]:
 
 
 def remember_file_id(token: str, unique_id: str, file_id: str) -> None:
-    cache = load_cache(token)
-    cache[str(unique_id)] = str(file_id)
-    _write_json(_cache_path(token), cache)
+    # 读—改—写全程持锁：多进程/多 bot 同时缓存 file_id 时，无锁的后写会
+    # 覆盖先写的（丢别的 unique 的缓存条目）。锁按缓存文件本身。
+    path = _cache_path(token)
+    with _CrossProcessLock(path):
+        cache = _read_json(path, {})
+        cache[str(unique_id)] = str(file_id)
+        _write_json(path, cache)
 
 
 # ---------- 挑选 ----------
@@ -233,12 +308,14 @@ def resolve_emoji(content: str, index: dict[str, list[dict[str, Any]]]
 def pick(pool: list[dict[str, Any]], combo_key: str) -> dict[str, Any]:
     """池里随机挑一张，避开这个组合键上次刚发的那张（脸自动有变化）。"""
     state_path = sticker_dir() / "state.json"
-    state = _read_json(state_path, {})
-    last = state.get(combo_key)
-    candidates = [e for e in pool if str(e.get("file_unique_id")) != str(last)]
-    entry = random.choice(candidates or pool)
-    state[combo_key] = str(entry.get("file_unique_id"))
-    _write_json(state_path, state)
+    # 读—改—写持锁：并发发送同一组合键时，无锁的后写会覆盖别的键的避重记忆。
+    with _CrossProcessLock(state_path):
+        state = _read_json(state_path, {})
+        last = state.get(combo_key)
+        candidates = [e for e in pool if str(e.get("file_unique_id")) != str(last)]
+        entry = random.choice(candidates or pool)
+        state[combo_key] = str(entry.get("file_unique_id"))
+        _write_json(state_path, state)
     return entry
 
 
@@ -436,24 +513,37 @@ def tool_sticker_import(args: dict[str, Any], token: str,
             "归档自动化了，审美别自动化——标签要看着图写。"
         )
 
-    # ---- 认领入库 ----
-    new_id = _next_id(stickers)
-    img_dir = sticker_dir() / "img"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    final = img_dir / f"{new_id:03d}{archive.suffix.lower()}"
-    final.write_bytes(archive.read_bytes())
-    entry = {
-        "id": new_id,
-        "title": title,
-        "desc": str(args.get("desc") or ""),
-        "tags": [str(t) for t in args.get("tags") or [] if str(t).strip()],
-        "emoji": emoji,
-        "emojis": [_strip_vs(str(e)) for e in args.get("emojis") or [] if str(e).strip()],
-        "file": str(final.relative_to(sticker_dir())),
-        "file_unique_id": unique,
-    }
-    stickers.append(entry)
-    save_library(stickers)
+    # ---- 认领入库（跨进程事务）----
+    # 编号分配 + 唯一身份去重 + 馆藏写回必须在一把锁里一次做完：否则并发的两个
+    # 进程各拿旧快照算出同一个 id、写同一个原图、后写覆盖先写（B1）。下载已在锁外
+    # 完成；这里只做提交，且**锁内重读**库、不信锁外那份可能已过期的 stickers。
+    entry: dict[str, Any] = {}
+    new_id = -1
+    with _CrossProcessLock(sticker_dir() / "library.json"):
+        stickers = load_library()
+        existing = _find_by_unique(stickers, unique)
+        if existing is None:
+            new_id = _next_id(stickers)
+            img_dir = sticker_dir() / "img"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            # 原图按 file_unique_id（跨 bot 恒定的稳定身份）命名，不按会撞车的顺序号：
+            # 万一锁失灵，稳定名也让两张不同的贴纸落到不同文件、不互相覆盖。
+            final = img_dir / f"{unique}{archive.suffix.lower()}"
+            final.write_bytes(archive.read_bytes())
+            entry = {
+                "id": new_id,
+                "title": title,
+                "desc": str(args.get("desc") or ""),
+                "tags": [str(t) for t in args.get("tags") or [] if str(t).strip()],
+                "emoji": emoji,
+                "emojis": [_strip_vs(str(e)) for e in args.get("emojis") or [] if str(e).strip()],
+                "file": str(final.relative_to(sticker_dir())),
+                "file_unique_id": unique,
+            }
+            stickers.append(entry)
+            save_library(stickers)
+
+    # 锁外收尾：缓存 file_id（缓存有自己的锁，别嵌在库锁里）、清待认领区
     if file_id:
         remember_file_id(token, unique, file_id)
     pending_json = _pending_dir() / f"{unique}.json"
@@ -462,6 +552,10 @@ def tool_sticker_import(args: dict[str, Any], token: str,
             leftover.unlink()
         except OSError:
             pass
+    if existing is not None:
+        # 并发下另一个进程已把它入库——认它、不重复建号（原图也已由那次归档）
+        return (f"这张已经是馆藏 {existing.get('id')} 号「{existing.get('title')}」了"
+                f"（并发入库已合并，file_id 也更新进本 bot 缓存）。")
     aliases = "".join(entry["emojis"])
     return (f"入库：馆藏 {new_id} 号「{title}」{emoji}{aliases}，原图归档 {entry['file']}。"
             f"现在（{emoji}）这类标记和 tg_sticker_send 都能命中它了。")

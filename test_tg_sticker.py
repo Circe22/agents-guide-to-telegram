@@ -314,6 +314,99 @@ class TestImport(Base):
             tg_sticker.tool_sticker_import({"file_id": "F"}, TOKEN, bad_api, lambda p: b"")
 
 
+# ---------- 并发导入（跨进程事务）----------
+class TestConcurrentImport(Base):
+    """B1：多进程/多会话共用库目录时，并发导入不许互相覆盖。
+
+    稳定并发测试——**不碰内部调度钩子**（不 patch load_library）。屏障放在
+    download 回调（公开入参）上：所有线程同时下载完、同时挤向提交段，制造最大
+    争用；有锁则逐个提交、N 张全在，无锁则读—改—写丢失更新（审查 B1 的病灶）。
+
+    反向变异：把 tool_sticker_import 提交段的 `_CrossProcessLock` 去掉，
+    此测试必转红（final 少于 N 张，或 id/原图撞车）。
+    """
+
+    def test_concurrent_imports_all_survive(self):
+        import threading
+
+        tg_sticker.save_library([])
+        n = 6
+        ready = threading.Barrier(n)
+        errors: list[str] = []
+        labels = [chr(ord("A") + i) for i in range(n)]
+
+        def api(method, data, files=None):
+            fid = str(data.get("file_id"))
+            return {"ok": True, "result": {
+                "file_unique_id": "U" + fid, "file_path": fid + ".webp",
+                "file_size": 1}}
+
+        def download(remote):
+            # 下载完统一在屏障处集合，再一起冲提交段——最大化争用
+            try:
+                ready.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+            return remote.encode()
+
+        def worker(label):
+            try:
+                tg_sticker.tool_sticker_import(
+                    {"file_id": label, "title": f"猫{label}", "emoji": "😺"},
+                    TOKEN, api, download)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(x,), name=x) for x in labels]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [], f"并发导入报错：{errors}")
+        lib = tg_sticker.load_library()
+        self.assertEqual(len(lib), n, f"有导入被覆盖丢掉了：{lib}")
+        ids = [e["id"] for e in lib]
+        self.assertEqual(len(set(ids)), n, f"编号撞车：{ids}")
+        files = [e["file"] for e in lib]
+        self.assertEqual(len(set(files)), n, f"原图路径撞车：{files}")
+        for e in lib:
+            self.assertTrue((self.dir / e["file"]).is_file(),
+                            f"原图丢了：{e['file']}")
+
+    def test_concurrent_same_sticker_dedups_to_one(self):
+        # 同一张贴纸被两个进程同时导入：锁内重读去重，只入一次、不建两个号
+        import threading
+
+        tg_sticker.save_library([])
+        ready = threading.Barrier(2)
+
+        def api(method, data, files=None):
+            return {"ok": True, "result": {
+                "file_unique_id": "SAME", "file_path": "x.webp", "file_size": 1}}
+
+        def download(remote):
+            try:
+                ready.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+            return b"same-bytes"
+
+        def worker(fid):
+            tg_sticker.tool_sticker_import(
+                {"file_id": fid, "title": "同一只", "emoji": "😺"},
+                TOKEN, api, download)
+
+        threads = [threading.Thread(target=worker, args=(f,)) for f in ("F1", "F2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        lib = tg_sticker.load_library()
+        self.assertEqual(len(lib), 1, f"同一张贴纸被入库两次：{lib}")
+
+
 # ---------- 句内标记 ----------
 class TestSplitMessage(Base):
     def setUp(self):
