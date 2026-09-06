@@ -288,6 +288,31 @@ def _amend_if_gen(state_path: Path, gen: int, patch: dict) -> bool:
         return False
 
 
+# 编辑/删除失败里，只有这一类拒收能证明"目标消息已不存在"，才该弃窗重开。
+# 超时 / 429 / 5xx 都是临时的，不证明消息没了——清了 msg_id 就丢掉还能用的窗、
+# 开一扇新的、旧窗失去登记、Stop 也收不掉它（B4）。文案信号全小写比对。
+_MESSAGE_GONE_SIGNS = (
+    "message to edit not found",
+    "message to delete not found",
+    "message can't be edited",
+    "message can't be deleted",
+    "message identifier is not specified",
+    "message identifier is invalid",
+    "message_id_invalid",
+    "message not found",
+)
+
+
+def _looks_message_gone(exc: Exception) -> bool:
+    """复用贴纸迁移的判据思路：先认错误码（只有 API 拒收才带 error_code=400），
+    再在 400 里按文案收窄。拿不到 code（超时/网络错=普通 RuntimeError）一律不算没了。
+    """
+    if getattr(exc, "code", None) != 400:
+        return False
+    text = str(exc).lower()
+    return any(sign in text for sign in _MESSAGE_GONE_SIGNS)
+
+
 def _blocks(lines: list[str], total: int, done: bool = False,
             draft: bool = False) -> list[dict]:
     # total 必须单独记：lines 只留最近 40 条，拿 len(lines) 当步数的话，
@@ -403,10 +428,14 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
                 "message_id": message_id,
                 "rich_message": _rich(_blocks(lines, total)),
             })
-        except Exception:
-            # 那条消息没了（被删/被清），松开手，下一帧重新开一扇。
-            # 也要过栅栏——这一轮已经结束的话，别把新一轮的 claim 清成孤儿。
-            _amend_if_gen(state_path, gen, {"msg_id": 0, "claim": 0, "claim_at": 0.0})
+        except Exception as exc:
+            # 只有**确认目标消息已不存在**的拒收才弃窗（松开手、下一帧重开一扇）。
+            # 超时/429/5xx 都不证明 42 被删——保留 msg_id、下一帧照常重试同一扇窗，
+            # 不然临时抖一下就丢窗、开新窗、旧窗失登记 Stop 收不掉（B4）。
+            # 弃窗也要过栅栏——这一轮已经结束的话，别把新一轮的 claim 清成孤儿。
+            if _looks_message_gone(exc):
+                _amend_if_gen(state_path, gen,
+                              {"msg_id": 0, "claim": 0, "claim_at": 0.0})
     except Exception:
         pass          # 铁律①：推送失败绝不影响 agent
     return 0

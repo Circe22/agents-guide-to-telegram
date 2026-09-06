@@ -436,6 +436,77 @@ class FrameOrdering(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["msg_id"], 42)
 
 
+@needs_hook
+class EditErrorClassification(unittest.TestCase):
+    """B4：进度窗只在**确认消息已不存在**时弃窗；超时/429/5xx 保留窗口。
+
+    误把临时错误当"消息没了"＝清 msg_id、开新窗、旧窗失登记、Stop 收不掉它。
+
+    反向变异：把 _push_locked 里的 `if _looks_message_gone(exc):` 改回无条件
+    `_amend_if_gen(...msg_id:0...)`，test_timeout_preserves_window 必转红。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_dir = hook.STATE_DIR
+        hook.STATE_DIR = Path(self.tmp.name)
+        self.had = os.environ.get("TG_CHAT_ID")
+        os.environ["TG_CHAT_ID"] = "888"
+        self.original = mcp.call_api
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        hook.STATE_DIR = self.old_dir
+        if self.had is None:
+            os.environ.pop("TG_CHAT_ID", None)
+        else:
+            os.environ["TG_CHAT_ID"] = self.had
+        self.tmp.cleanup()
+
+    def _seed(self):
+        import time as _t
+        path = hook._state_path("s")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"seq": 1, "gen": 0, "msg_id": 42,
+                                    "lines": ["⚡ Bash"], "total": 1,
+                                    "last_push": _t.time()}), encoding="utf-8")
+        return path
+
+    def _msg_id(self, path):
+        return int(json.loads(path.read_text()).get("msg_id") or 0)
+
+    def test_timeout_preserves_window(self):
+        path = self._seed()
+        mcp.call_api = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("timeout"))
+        hook._push(path, 1)
+        self.assertEqual(self._msg_id(path), 42, "临时超时不该弃窗")
+
+    def test_429_preserves_window(self):
+        path = self._seed()
+        def api(method, data, files=None):
+            raise mcp.ApiRejected("Too Many Requests: retry after 5", 429)
+        mcp.call_api = api
+        hook._push(path, 1)
+        self.assertEqual(self._msg_id(path), 42, "429 不该弃窗")
+
+    def test_confirmed_gone_clears_window(self):
+        path = self._seed()
+        def api(method, data, files=None):
+            raise mcp.ApiRejected("Bad Request: message to edit not found", 400)
+        mcp.call_api = api
+        hook._push(path, 1)
+        self.assertEqual(self._msg_id(path), 0, "确认消息没了才该弃窗重开")
+
+    def test_generic_400_preserves_window(self):
+        # 400 是杂物袋——不点名消息没了的 400（如参数错）不该弃窗
+        path = self._seed()
+        def api(method, data, files=None):
+            raise mcp.ApiRejected("Bad Request: message text is empty", 400)
+        mcp.call_api = api
+        hook._push(path, 1)
+        self.assertEqual(self._msg_id(path), 42, "无关 400 不该弃窗")
+
+
 class MediaUpload(unittest.TestCase):
     """media_paths → multipart。坏了＝要么发不出图，要么把凭证文件当图发出去。"""
 
