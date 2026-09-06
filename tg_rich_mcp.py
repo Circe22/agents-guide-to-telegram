@@ -393,16 +393,49 @@ def _int_arg(args: dict[str, Any], key: str, what: str) -> int:
         raise ValueError(f"{key} 必须是整数（{what}）") from None
 
 
+class PartialSendError(RuntimeError):
+    """分段发送中途失败：携带已送达段的账，绝不让前段 message_id 从错误里丢失。
+
+    RuntimeError 子类，故 handle 的 except 原样接住、走 isError 返回——但 str()
+    带着完整的分段送达账（delivered/failed/unknown + 已确认 message_id），
+    调用方据此**只补失败段、绝不整条重发**。
+    """
+
+
+def _ledger_text(
+    lines: list[str],
+    delivered: list[dict[str, Any]],
+    failed: list[dict[str, Any]],
+    unknown: list[dict[str, Any]],
+    aborted: str | None = None,
+) -> str:
+    """人类可读文案 + 机器可读分段送达账（坑 17 的记账落在这儿）。"""
+    ledger = {"delivered": delivered, "failed": failed, "unknown": unknown}
+    body = "\n  ".join(lines)
+    if aborted:
+        human = (
+            "分段发送中途失败——已送达的段记录在下面且**保留**，"
+            f"整条禁止重试（会把已送达的段发重）。中断：{aborted}\n  " + body
+            + "\n⚠️ unknown 段可能已被 Telegram 收到（超时/网络错，送达状态未知），"
+            "不得当成没发出去自动补发；要补只补 unknown/failed 里点名的那几段。"
+        )
+    else:
+        human = ("已按标记位置分段送达：\n  " + body
+                 + "\n（句内贴纸标记层可用 TG_STICKER_MARKERS=0 整体关闭）")
+    return human + "\n分段送达账（机器可读）：" + json.dumps(ledger, ensure_ascii=False)
+
+
 def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> str:
     """按标记位置分段发：文字段走富消息，标记处发真贴纸。
 
-    坑 17 的纪律就落在这儿：**分段记账**。贴纸段失败不牵连已送达的文字
-    （话已经送到了，脸没送到只记一笔），整条也绝不自动重试。
+    坑 17 的纪律就落在这儿：**分段记账**。每段编号，产出机器可读的
+    delivered / failed / unknown（含已确认 message_id）。贴纸段失败不牵连已送达的
+    文字（话已经送到了，脸没送到只记一笔）；**后段正文失败也保留前段已送达的 id**，
+    整条绝不自动重试——超时段标 unknown（可能已送达），不得当成肯定没发出去补发。
 
     孤儿贴纸防护：脸是贴给它前面那句话的（位置即语义），所以**脸不许先于
     它所依附的那句话出门**。标记写在句首时贴纸段排在文字段前面，若照顺序发，
-    贴纸成功、正文随后失败＝对方收到一张没头没尾的脸——比缺一张脸更糟，那是
-    把语气安在了一句不存在的话上。规则：
+    贴纸成功、正文随后失败＝对方收到一张没头没尾的脸——比缺一张脸更糟。规则：
 
     - 整条没有正文段（纯贴纸）：照常直发，不存在孤儿问题；
     - 有正文段：贴纸挂起，第一条正文真送达后立刻补发，位置不变；
@@ -412,24 +445,42 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
     chat = _resolve_chat(args)
     token = _token()
     reply_to = _int_arg(args, "reply_to", "要引用的那条消息的 message_id")
-    lines: list[str] = []
-    has_text = any(kind == "text" and payload for kind, payload in parts)
-    text_delivered = False
-    held: list[Any] = []   # 正文落地前挂起的贴纸段
 
-    def _fire(payload: Any) -> None:
+    # 段落编排：滤掉空文字段，给每段编号（分段记账挂在这些号上）
+    plan = [(k, p) for k, p in parts if not (k == "text" and not p)]
+
+    lines: list[str] = []
+    delivered: list[dict[str, Any]] = []   # 已确认送达（带 message_id）
+    failed: list[dict[str, Any]] = []      # 明确没送出去（贴纸失败 / 孤儿挂起 / 服务器拒收）
+    unknown: list[dict[str, Any]] = []     # 送达状态未知（超时/网络错，禁止当没发自动补发）
+    has_text = any(k == "text" for k, _ in plan)
+    text_delivered = False
+    held: list[tuple[int, Any]] = []       # 正文落地前挂起的贴纸段（带段号）
+
+    def _fire(seg: int, payload: Any) -> None:
         pool, combo, raw = payload
         try:
             entry = tg_sticker.pick(pool, combo)
             tg_sticker.send_entry(entry, chat, token, call_api)
             lines.append(f"贴纸「{entry.get('title')}」← 标记 {raw}")
+            delivered.append({"seg": seg, "kind": "sticker",
+                              "title": str(entry.get("title") or ""), "marker": raw})
         except (RuntimeError, ValueError, OSError) as exc:
             lines.append(f"贴纸未送达 ← 标记 {raw}（{exc}）")
+            failed.append({"seg": seg, "kind": "sticker", "marker": raw,
+                           "error": str(exc)})
 
-    for kind, payload in parts:
+    def _abort(seg: int, exc: Exception, bucket: list[dict[str, Any]]) -> None:
+        bucket.append({"seg": seg, "kind": "text", "error": str(exc)})
+        for hseg, hp in held:   # 中断时挂起的脸永不发送，记一笔"没发"
+            failed.append({"seg": hseg, "kind": "sticker", "marker": hp[2],
+                           "error": "前段正文未送达，孤儿防护未发"})
+        raise PartialSendError(
+            _ledger_text(lines, delivered, failed, unknown, aborted=str(exc))
+        ) from None
+
+    for seg, (kind, payload) in enumerate(plan, 1):
         if kind == "text":
-            if not payload:
-                continue
             data: dict[str, Any] = {
                 "chat_id": chat,
                 "rich_message": json.dumps({"markdown": payload}, ensure_ascii=False),
@@ -438,27 +489,34 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
                 data["disable_notification"] = "true"
             if not text_delivered and reply_to:
                 data["reply_parameters"] = json.dumps({"message_id": reply_to})
-            response = call_api("sendRichMessage", data)
+            try:
+                response = call_api("sendRichMessage", data)
+            except ApiRejected as exc:
+                # 服务器明确拒收（ok:false）＝这段肯定没发出去 → failed（可安全重发这一段）
+                _abort(seg, exc, failed)
+            except (RuntimeError, OSError) as exc:
+                # 网络异常/超时＝可能已被 Telegram 收到 → unknown（禁止自动补发）
+                _abort(seg, exc, unknown)
             result = response.get("result")
             mid = result.get("message_id") if isinstance(result, dict) else result
             if isinstance(mid, int):
                 _LAST_SENT[chat] = mid
             lines.append(f"文字段（message_id: {mid}）")
+            delivered.append({"seg": seg, "kind": "text", "message_id": mid})
             text_delivered = True
-            for pending in held:
-                _fire(pending)
+            for hseg, hp in held:
+                _fire(hseg, hp)
             held.clear()
         else:
             if has_text and not text_delivered:
-                held.append(payload)   # 脸先憋着，等它依附的话真送到
+                held.append((seg, payload))   # 脸先憋着，等它依附的话真送到
             else:
-                _fire(payload)
-    for pending in held:   # 走完了正文却一条都没送出去：记账，不补发
-        lines.append(f"贴纸未送达 ← 标记 {pending[2]}（正文未送达，孤儿防护挂起）")
-    return (
-        "已按标记位置分段送达：\n  " + "\n  ".join(lines)
-        + "\n（句内贴纸标记层可用 TG_STICKER_MARKERS=0 整体关闭）"
-    )
+                _fire(seg, payload)
+    for hseg, hp in held:   # 走完了正文却一条都没送出去：记账，不补发
+        lines.append(f"贴纸未送达 ← 标记 {hp[2]}（正文未送达，孤儿防护挂起）")
+        failed.append({"seg": hseg, "kind": "sticker", "marker": hp[2],
+                       "error": "正文未送达，孤儿防护挂起"})
+    return _ledger_text(lines, delivered, failed, unknown)
 
 
 def tool_send(args: dict[str, Any]) -> str:

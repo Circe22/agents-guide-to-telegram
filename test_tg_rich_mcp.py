@@ -699,6 +699,98 @@ class OrphanStickerGuard(unittest.TestCase):
         self.assertIn('"message_id": 42', data.get("reply_parameters", ""))
 
 
+class PartialSendLedger(unittest.TestCase):
+    """B2：分段发送后段失败，前段已送达的 message_id 绝不能从错误里丢。
+
+    坑 17 的记账要覆盖**后续文字段失败**，不只贴纸段：返回机器可读的
+    delivered/failed/unknown + 已确认 id；超时段标 unknown（可能已送达，禁止
+    自动整条重发），服务器拒收标 failed（肯定没发，可安全补这一段）。
+
+    反向变异：把 _send_with_stickers 里 text 发送的 try/except 去掉（让异常直接
+    冒出去），test_later_text_failure_keeps_delivered_id 必转红（701 从结果消失）。
+    """
+
+    def setUp(self):
+        from test_tg_sticker import make_library
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["TG_STICKER_DIR"] = self.tmp.name
+        make_library(Path(self.tmp.name))
+        self.had = {k: os.environ.get(k) for k in ("TG_CHAT_ID", "TG_BOT_TOKEN")}
+        os.environ["TG_CHAT_ID"] = "-100555"
+        os.environ["TG_BOT_TOKEN"] = FAKE_TOKEN
+        # 本 bot 先缓存好 file_id，贴纸段直接走缓存、不碰归档上传
+        import tg_sticker
+        tg_sticker.remember_file_id(FAKE_TOKEN, "UNIQ2", "CACHED_FID")
+        self.texts: list[str] = []
+        self.original = mcp.call_api
+        mcp._LAST_SENT.clear()
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        os.environ.pop("TG_STICKER_DIR", None)
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        mcp._LAST_SENT.clear()
+        self.tmp.cleanup()
+
+    def _ledger(self, text: str) -> dict:
+        marker = "分段送达账（机器可读）："
+        return json.loads(text.split(marker, 1)[1])
+
+    def test_later_text_failure_keeps_delivered_id(self):
+        # first 段送达（id 701）→ 贴纸 →  second 段超时。已送达的 701 必须还在结果里。
+        def api(method, data, files=None):
+            if method == "sendRichMessage":
+                self.texts.append(json.loads(data["rich_message"])["markdown"])
+                if len(self.texts) == 2:
+                    raise RuntimeError("simulated timeout")
+                return {"ok": True, "result": {"message_id": 701}}
+            return {"ok": True, "result": {"message_id": 999}}
+
+        mcp.call_api = api
+        result = call_tool("tg_rich_send", {"markdown": "first（😭）second"})
+        self.assertEqual(self.texts, ["first", "second"])
+        blob = json.dumps(result, ensure_ascii=False)
+        self.assertIn("701", blob, "已送达的 message_id 从错误结果里丢了")
+        self.assertTrue(result["result"].get("isError"))
+        ledger = self._ledger(result["result"]["content"][0]["text"])
+        self.assertIn(701, [d.get("message_id") for d in ledger["delivered"]])
+        self.assertTrue(ledger["unknown"], "超时段应记进 unknown（可能已送达）")
+        self.assertEqual(ledger["unknown"][0]["kind"], "text")
+
+    def test_api_rejection_marks_failed_not_unknown(self):
+        # 服务器明确拒收（ok:false → ApiRejected）＝这段肯定没发出去，进 failed 不进 unknown
+        def api(method, data, files=None):
+            if method == "sendRichMessage":
+                self.texts.append(json.loads(data["rich_message"])["markdown"])
+                if len(self.texts) == 2:
+                    raise mcp.ApiRejected("API 拒收: message is too long", 400)
+                return {"ok": True, "result": {"message_id": 701}}
+            return {"ok": True, "result": {"message_id": 999}}
+
+        mcp.call_api = api
+        result = call_tool("tg_rich_send", {"markdown": "first（😭）second"})
+        ledger = self._ledger(result["result"]["content"][0]["text"])
+        self.assertIn(701, [d.get("message_id") for d in ledger["delivered"]])
+        self.assertEqual(ledger["unknown"], [], "拒收不该记成送达状态未知")
+        self.assertTrue(any(f.get("kind") == "text" for f in ledger["failed"]))
+
+    def test_success_carries_machine_readable_ledger(self):
+        def api(method, data, files=None):
+            return {"ok": True, "result": {"message_id": 55}}
+
+        mcp.call_api = api
+        out = mcp.tool_send({"markdown": "第一句（😭）第二句"})
+        ledger = self._ledger(out)
+        kinds = [d["kind"] for d in ledger["delivered"]]
+        self.assertEqual(kinds, ["text", "sticker", "text"])
+        self.assertEqual(ledger["failed"], [])
+        self.assertEqual(ledger["unknown"], [])
+
+
 class DraftCanStop(unittest.TestCase):
     """can_stop / keep_on_stop 透传：开了才带，没开一个字节都不多发。"""
 
