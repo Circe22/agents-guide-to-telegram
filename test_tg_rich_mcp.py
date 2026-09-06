@@ -1414,5 +1414,97 @@ class StopLifecycleAcrossModes(unittest.TestCase):
                          "Stop 后排队的旧 draft 还喷了一帧空草稿")
 
 
+@needs_hook
+class StopCleanupPersistence(unittest.TestCase):
+    """R5（收编审查反例）：Stop 同步收尾抢不到推送锁时，清理责任必须落进 state，
+    由后续持同一把推送锁的执行者恢复——不能随 Stop 被宿主超时/进程退出一起丢。
+
+    审查那支跑真实子进程 + 15s 宿主超时；这里用**同进程持锁 + 有界超时缩短**复现
+    同一业务结果（不占 15s），并补一支「后续执行者真把它补做掉」的恢复用例。
+
+    反向变异：把 _finish_session 第一步里写 pending_cleanup 的那几行拿掉，
+    test_stop_timeout_persists_cleanup_responsibility 转红（责任凭空消失）；
+    把 _push_locked / _drain_pending_cleanup 的补做逻辑拿掉，
+    test_persisted_cleanup_recovered_by_next_executor 转红（窗永远收不掉）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_dir = hook.STATE_DIR
+        hook.STATE_DIR = Path(self.tmp.name)
+        self.had = {k: os.environ.get(k) for k in
+                    ("TG_CHAT_ID", "TG_PROGRESS_MODE", "TG_PROGRESS_END")}
+        os.environ["TG_CHAT_ID"] = "8888"
+        os.environ.pop("TG_PROGRESS_MODE", None)
+        os.environ.pop("TG_PROGRESS_END", None)   # 默认 delete
+        self.original = mcp.call_api
+        self.calls: list[tuple[str, dict]] = []
+        mcp.call_api = lambda method, data, files=None: (
+            self.calls.append((method, dict(data))), {"ok": True, "result": {}})[1]
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        hook.STATE_DIR = self.old_dir
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _seed(self, **extra):
+        import time as _t
+        state = {"seq": 1, "gen": 0, "claim": 1, "claim_at": _t.time(),
+                 "msg_id": 42, "lines": ["⚡ Bash"], "total": 1,
+                 "last_push": _t.time(), "draft_id": 9}
+        state.update(extra)
+        path = hook._state_path("s6")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        return path
+
+    def test_stop_timeout_persists_cleanup_responsibility(self):
+        path = self._seed()
+        push_lock = open(str(path) + ".push.lock", "w", encoding="utf-8")
+        import fcntl as _f
+        _f.flock(push_lock, _f.LOCK_EX)            # 模拟在飞的慢编辑握着推送锁
+        try:
+            with mock.patch.object(hook, "_FINISH_PUSH_WAIT_SECONDS", 0.3):
+                hook._finish_session("s6")         # 抢不到锁、有界超时后返回
+        finally:
+            _f.flock(push_lock, _f.LOCK_UN)
+            push_lock.close()
+        self.assertEqual(self.calls, [], "锁被占住时不该有清理请求发出去")
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(int(state.get("msg_id") or 0), 0, "活动窗口该已清空")
+        task = state.get("pending_cleanup")
+        self.assertIsInstance(task, dict, "清理责任没落进 pending_cleanup")
+        self.assertEqual(int(task.get("msg_id") or 0), 42, "42 号窗的清理责任丢了")
+
+    def test_persisted_cleanup_recovered_by_next_executor(self):
+        # 先制造一个「Stop 没做完、责任落盘」的 state
+        path = self._seed()
+        push_lock = open(str(path) + ".push.lock", "w", encoding="utf-8")
+        import fcntl as _f
+        _f.flock(push_lock, _f.LOCK_EX)
+        try:
+            with mock.patch.object(hook, "_FINISH_PUSH_WAIT_SECONDS", 0.3):
+                hook._finish_session("s6")
+        finally:
+            _f.flock(push_lock, _f.LOCK_UN)
+            push_lock.close()
+        self.assertEqual(self.calls, [])
+        # 后续执行者：新一轮的 push 持同一把推送锁，应把 42 号窗补删、并清掉责任
+        path.write_text(json.dumps({**json.loads(path.read_text()),
+                                    "claim": 5, "seq": 5, "sched_seq": 5,
+                                    "last_push": 0.0}), encoding="utf-8")
+        hook._push(path, 5)
+        deleted = [int(d.get("message_id") or 0)
+                   for m, d in self.calls if m == "deleteMessage"]
+        self.assertIn(42, deleted, "后续执行者没把遗留的窗收掉")
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(state.get("pending_cleanup"), "补做后应清掉 pending_cleanup")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
