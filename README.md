@@ -21,7 +21,7 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 | `tg_sticker_hook.py` | 入站贴纸识别 hook：认识的注入标签（agent 不用看图）、不认识的提醒归档 | ⚠️ **仅 Claude Code**（UserPromptSubmit 钩子）；零网络、fail-silent |
 | `secret_redaction.py` | 密钥形态的单一真源，上面的都用它 | 跟着走，别单独删 |
 | `sticker-spec/` | 贴纸标记语法的规格真源：共享 golden fixtures，多实现各自跑同一份止漂移（见 COOKBOOK 贴纸章末节） | ✅ 任何实现这套标记语法的都该跑 |
-| `test_*.py` | 169 个测试（含 `test_conformance.py` 跑 sticker-spec），`python3 -m unittest discover -v`，1 秒内、不发网络 | — |
+| `test_*.py` | 一批测试（含 `test_conformance.py` 跑 sticker-spec），`python3 -m unittest discover -v`，**无需 Telegram 凭证、不发网络**；耗时取决于环境 | — |
 
 外加一份 **[COOKBOOK.md](COOKBOOK.md)** —— Telegram 富消息**能玩什么**的全景清单：
 行内公式、剧透、上下标、脚注、锚点跳转、任务清单、表格高级字段、地图、拼贴轮播、
@@ -116,7 +116,18 @@ chmod 600 ~/.tg-rich-mcp.json
 }
 ```
 
-只依赖 `requests`（`pip install requests`）。协议是手写的 JSON-RPC over stdio，不需要 mcp SDK。
+只依赖 `requests`，协议是手写的 JSON-RPC over stdio，不需要 mcp SDK。完整安装：
+
+```bash
+git clone https://github.com/Circe22/agents-guide-to-telegram.git
+cd agents-guide-to-telegram
+python3 -m venv .venv && . .venv/bin/activate   # Python 3.9+
+pip install requests
+```
+
+⚠️ **`.mcp.json` 里的 `command` 要指向同一个解释器**——上面装 `requests` 用的 venv
+里的 `python`（即 `/绝对路径/.venv/bin/python`），别写成系统 `python3`，否则 MCP
+起的进程用的是另一套环境、`import requests` 失败。用哪个解释器装、就用哪个解释器起。
 
 #### 支持哪几版 MCP 协议
 
@@ -134,10 +145,11 @@ chmod 600 ~/.tg-rich-mcp.json
 > `ping` / `logging/setLevel` 被移除。
 > （[Key Changes](https://modelcontextprotocol.io/specification/2026-07-28)）
 >
-> 好在它留了向后兼容的路：**同时支持新旧两代协议的 stdio 客户端**，会先拿
-> `server/discover` 探测、失败再按旧握手回退——本 server 对它回 `method not found`，
-> 回退即成立（实测就是这个响应）。但**只实现了 2026-07-28 的客户端不在此列**，
-> 它连不上这个 server，这不是 bug，是两代协议的分界。
+> 好在规范留了向后兼容的路：新客户端**可以**先拿 `server/discover` 探测、
+> 失败再按旧握手回退——本 server 对它回 `method not found`，这条回退路即成立
+> （本 server 的响应实测是这个）。**但"是否真去探测、真回退"取决于客户端实现**，
+> 不是所有同时支持两代协议的 host 都一定这么做；只实现了 2026-07-28 的客户端更
+> 不在此列，连不上这个 server——这不是 bug，是两代协议的分界。
 > 真要支持新协议是另一个工程，欢迎提 PR。
 
 ### 3. 挂进度窗 hook（可选，仅 Claude Code）
@@ -272,11 +284,31 @@ tg_rich_send(markdown="## 今日进度\n\n- [x] 修完 bug\n- [ ] 写测试")
 没有 Markdown 语法的消息渲染出来就是普通文本，写了 `**重点**`、列表、代码块的
 自动长成原生样式，agent 不用每条都想"这条要不要富格式"。
 
+> ⚠️ **这是"调用方需要自己实现"的接入策略，不是本工具内置的行为**：`tg_rich_send`
+> 本身**没有** sendMessage 自动降级；server instructions 也仍让纯文字聊天走原来的
+> 发送工具。下面两条护栏是给"要照这个思路接"的调用方的接入约定，得你自己在外层写。
+
+接入示例（伪码）：
+
+```text
+try:
+    tg_rich_send(markdown=reply)
+except err:
+    if 是"格式/方法不支持"类拒收:   # 见护栏 1 的辨别
+        sendMessage(text=reply)      # 降级重发同一段
+    else:
+        raise                        # 其它错不降级
+```
+
 两条护栏（这个接法实跑出来的，别省）：
 
-1. **降级只认 400 / 404**：Telegram 明确拒收（格式/能力问题）时才退回普通
-   `sendMessage` 重发同一段；**网络错、超时、5xx、429 一律原样抛错，不自动补发**——
-   这些状态下 Telegram 可能已经收到了第一条，自动补发＝制造重复消息。
+1. **降级只认"格式/方法不支持"类拒收，`400 / 404` 只是候选范围不是判据**：Telegram
+   因富格式/能力问题拒收时才退回普通 `sendMessage` 重发同一段。但 `400` 是杂物袋——
+   `chat not found`、`reply message not found`、`message text is empty` 也报 400，
+   `404` 也可能是 token/路径错；这些**不该**降级成纯文本（降了也发不出、还盖掉真错因）。
+   要辨别的是"这段富消息本身不被接受"，不是"这次请求有别的毛病"。
+   **网络错、超时、5xx、429 一律原样抛错，不自动补发**——这些状态下 Telegram 可能
+   已经收到了第一条，自动补发＝制造重复消息。
 2. **只包纯文字出口**：引用回复、附件、贴纸等旁路照走原来的路，别把整条发送链
    都塞进渲染器——包的面越大，降级时要复原的状态越多。
 
@@ -332,7 +364,10 @@ tg_rich_send(
 ```
 
 - 第 i 个路径＝`attach://f{i}`。`collage` 换成 `slideshow` 就是左右翻页；
-  单个 `photo` 块就是普通发图。每个文件 ≤50MB、一条消息最多 50 个。
+  单个 `photo` 块就是普通发图。一条消息最多 50 个媒体。**三个"上限"不是一回事，别混**：
+  - **本地拦截阈值**：本工具对每个文件按 50 MiB 拦（`MEDIA_MAX_BYTES`），是内存/误传保护，不是 Telegram 的承诺；
+  - **累计输入预算**：一次调用所有文件读进内存拼 multipart 的总量，默认 200 MiB（`TG_RICH_MEDIA_TOTAL_MB` 可调）；
+  - **Telegram 自己的类型上限**：走 multipart 上传，**照片 10MB、其它文件 50MB**（[Sending Files](https://core.telegram.org/bots/api#sending-files)）。所以一张 50MB 的"照片"过得了本地阈值，却发不出去——别把"≤50MB"当成任意图片都能发。
 - 发送成功的返回里带每个媒体的 **file_id**。存下来，下次 `media` 直接填
   file_id 复用，不用重新上传。**复用时整串程序化取用，别看着截断的显示手补
   尾巴**——file_id 彼此长得几乎一样，手打命中纯靠运气（作者试过，侥幸没炸）。
@@ -428,27 +463,31 @@ tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"]
 `callback_query`（Telegram 会记住这个设置）——又一个别和其他消费者
 共用 bot 的理由。
 
-### 块速查（全部实测发得出去）
+### 块速查（发送侧）
+
+状态口径与 COOKBOOK 对齐：**✅ 本项目真发出去验过**／**📖 官方文档列出、没逐个实测**／
+**⚠️ 有条件**。别把"文档列了"当成"实测过"。
 
 **块级**
 
-| type | 关键字段 |
-|---|---|
-| `paragraph` | `text` |
-| `heading` | `text`, `size`(1-6，1 最大) |
-| `pre` | `text`, `language?` |
-| `footer` / `divider` | `text` / — |
-| `mathematical_expression` | `expression`（裸 LaTeX） |
-| `list` | `items[]`（每项 `blocks`，可加 `has_checkbox` / `is_checked`） |
-| `blockquote` | `blocks[]`, `credit?` |
-| `pullquote` | `text`, `credit?` |
-| `table` | `cells[][]`, `is_bordered?`, `is_striped?`, `caption?` |
-| `details` | `summary`, `blocks[]`, `is_open?` |
-| `anchor` | `name`（配行内 `anchor_link` 做页内跳转） |
-| `map` | `location{latitude,longitude}`, `zoom`, `width`, `height` |
-| `collage` / `slideshow` | `blocks[]`, `caption?`（caption 是**对象**不是字符串） |
-| `photo`/`video`/`audio`/`animation`/`voice_note` | 对应 `InputMedia*` + `caption?` |
-| `thinking` | `text` —— **仅 draft 可用** |
+| type | 关键字段 | 状态 |
+|---|---|---|
+| `paragraph` | `text` | ✅ |
+| `heading` | `text`, `size`(1-6，1 最大) | ✅ |
+| `pre` | `text`, `language?` | ✅ |
+| `footer` / `divider` | `text` / — | ✅ |
+| `mathematical_expression` | `expression`（裸 LaTeX） | ✅ |
+| `list` | `items[]`（每项 `blocks`，可加 `has_checkbox` / `is_checked`） | ✅ |
+| `blockquote` | `blocks[]`, `credit?` | ✅ |
+| `pullquote` | `text`, `credit?` | ✅ |
+| `table` | `cells[][]`, `is_bordered?`, `is_striped?`, `caption?` | ✅ |
+| `details` | `summary`, `blocks[]`, `is_open?` | ✅ |
+| `anchor` | `name`（配行内 `anchor_link` 做页内跳转） | ✅ |
+| `map` | `location{latitude,longitude}`, `zoom`, `width`, `height` | ✅ |
+| `collage` / `slideshow` | `blocks[]`, `caption?`（caption 是**对象**不是字符串） | ✅ |
+| `photo` | `photo`(InputMediaPhoto) + `caption?` | ✅ |
+| `video` / `audio` / `animation` / `voice_note` | 对应 `InputMedia*` + `caption?` | 📖 未逐项实测 |
+| `thinking` | `text` | ⚠️ **仅 draft 可用** |
 
 **行内**：任何 `text` 字段都能传数组，元素是字符串或 `{type, text}`。
 表格单元格的 `text` 同样收数组。
@@ -586,7 +625,10 @@ tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"]
     症状签名：**文本消息一直正常、发文件稳定报网络错**——先别怀疑 Telegram，
     大概率是你的 HTTP 客户端在用流式 body 发 multipart、被代理掐了
     （文本是定长 JSON POST，不受影响，所以只有媒体炸）。
-    把文件整读进内存再发（定长 body）就好，≤50MB 的上限内整读是安全的。
+    把文件整读进内存再发（定长 body）就好。⚠️ "整读是否安全"取决于**进程可用内存**：
+    本工具按每文件 50 MiB / 累计默认 200 MiB 拦（拼 multipart 还有额外开销，未测实际
+    RSS），别把"≤50MB"读成"任意情况下整读都无害"。真要发超大批量该走临时文件流式
+    ——"定长"不要求所有内容都驻留内存。文件字节预算、请求体、进程内存是三码事。
 
 17. **组合发送半途失败 ⇒ 重复消息**：先发文字段、再发文件段（或多个文字段）的
     复合调用，后段炸的时候前段其实已经送达；调用方看到整体报错去重试整条，
@@ -648,9 +690,11 @@ tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"]
   上传后要把「哪个文件 → 哪个 file_id」学下来，多媒体消息的对应关系
   得拿输入 blocks 的 attach 顺序对响应的媒体顺序，**数量对不齐就放弃学习**
   ——宁可下次重传，不能学错一张图。谁要用得上，欢迎按这个写。
-- **Ephemeral Messages**（10.2）：群里只有指定用户和 bot 能看见的消息
-  （`receiver_user_id`，`sendMessage` 全族都收，可编辑可删）。
-  值得单独一个工具——群里给某个人发悄悄话，别人看不见。
+- **Ephemeral Messages**（10.2 起；**10.3（2026-08-24）改为 `ephemeral_message_parameters`
+  对象**）：群里只有指定用户和 bot 能看见的消息，可编辑可删。10.3 起
+  `sendRichMessage` 也带上了这个参数——即**Telegram 已支持富消息发群内悄悄话**，
+  只是**本工具尚未暴露**这个参数。值得单独一个工具。
+  见[官方 10.3 更新](https://core.telegram.org/bots/api#august-24-2026)。
 - `InputRichMessage.media`：markdown / html 模式里引用媒体。
 - 状态文件不清理（一个会话一个 json，量极小）。
 
