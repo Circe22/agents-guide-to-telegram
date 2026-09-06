@@ -470,6 +470,25 @@ class TestSplitMessage(Base):
         # 未闭合围栏吃到文末，里面的表情不喷贴纸
         self.assertEqual([k for k, _ in tg_sticker.split_message("```\n（😾）")], ["text"])
 
+    def test_longer_closing_fence_boundary(self):
+        # R7（收编审查反例）：闭合围栏可比起始更长（CommonMark §4.5）——块内不发、块后仍发。
+        # 反向变异：把 _fenced_spans 的闭合改回「必须与起始等长」，较长的闭合围栏会被
+        # 当作没闭合、吃到文末，块后的（😾）被误遮，本测试「块后仍发」转红。
+        inside = tg_sticker.split_message("```\n（😾）\n````\n尾巴")
+        self.assertNotIn("sticker", [k for k, _ in inside])   # 块内不发
+        after = tg_sticker.split_message("```\ncode\n````\n说完了（😾）")
+        self.assertIn("sticker", [k for k, _ in after])        # 较长闭合围栏之后仍发
+
+    def test_inline_triple_backticks_boundary(self):
+        # R7（收编审查反例）：行首 ```code``` 的 info string 含反引号≠块围栏起始，
+        # 应按行内代码处理——只遮代码本身，后面正文照常喷贴纸。
+        # 反向变异：去掉起始围栏「反引号 info string 不得含反引号」的判定，整行被当围栏
+        # 起始、未闭合吃到文末，后面的（😾）被误遮，「代码外仍发」转红。
+        after = tg_sticker.split_message("```code``` 说完了（😾）")
+        self.assertIn("sticker", [k for k, _ in after])        # 代码外仍发
+        inside = tg_sticker.split_message("```（😾）``` 后面无标记")
+        self.assertNotIn("sticker", [k for k, _ in inside])    # 代码内不发
+
     def test_halfwidth_parens(self):
         self.assertEqual(self.kinds("好气(😾)"), ["text", "sticker"])
 

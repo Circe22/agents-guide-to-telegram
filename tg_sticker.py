@@ -739,15 +739,53 @@ def tool_sticker_import(args: dict[str, Any], token: str,
 
 # ---------- 句内标记（渲染器模式的第二层） ----------
 _MARKER_RE = re.compile(r"[（(]([^（）()\n]{1,32})[）)]")
-# 代码遮罩按 **Markdown 边界**，不是"单反引号/三反引号"的简易表达式（B8）：
-# ① 行首围栏（``` 或 ~~~，3+ 个）——闭合到等长同类围栏，未闭合则吃到文末；
+# 代码遮罩按 **CommonMark 边界**（B8 / R7），不是"单反引号/三反引号"的简易表达式：
+# ① 块围栏（``` 或 ~~~，3+ 个）——见 `_fenced_spans`：**闭合围栏可比起始更长**
+#    （CommonMark §4.5：闭合长度 ≥ 起始、同字符），未闭合则吃到文末；**反引号起始
+#    围栏的 info string 不得含反引号**（含了就不是围栏、按行内代码处理，避免误吞正文）。
 # ② 行内反引号跨度——N 个开、**等长的 N 个**闭（`` ``（😺）`` `` 里两个反引号是一对，
 #    中间的表情要遮住，旧正则把边界两个反引号各当成一段空代码、漏了中间）。
 # 讨论这套语法本身时（把标记写在代码里）就不会当场喷贴纸。
-_FENCE_RE = re.compile(
-    r"(?m)^[ \t]{0,3}(?P<f>`{3,}|~{3,})[^\n]*(?:\n[\s\S]*?(?:\n[ \t]{0,3}(?P=f)[ \t]*$|\Z)|\Z)"
-    r"|(?<!`)(?P<b>`+)(?!`)[\s\S]*?(?<!`)(?P=b)(?!`)"
-)
+_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
+_INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)")
+
+
+def _fenced_spans(text: str) -> list[tuple[int, int]]:
+    """按 CommonMark 找出块围栏覆盖的 [start, end) 区间。
+
+    - 起始围栏：行首（≤3 空格缩进）3+ 个 ``` 或 ~~~。反引号围栏的 info string
+      **不得含反引号**（含了就不是围栏——多半是行内代码，交给行内层处理）。
+    - 闭合围栏：同字符、长度 **≥ 起始**、整行只余空白；找不到则吃到文末。
+    """
+    spans: list[tuple[int, int]] = []
+    lines = text.splitlines(keepends=True)
+    offset = 0
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        body = raw.rstrip("\r\n")
+        m = _FENCE_OPEN_RE.match(body)
+        if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
+            offset += len(raw)
+            i += 1
+            continue
+        fence_char = m.group(1)[0]
+        fence_len = len(m.group(1))
+        start = offset
+        offset += len(raw)
+        i += 1
+        close_re = re.compile(r"^[ \t]{0,3}" + re.escape(fence_char)
+                              + r"{" + str(fence_len) + r",}[ \t]*$")
+        closed = False
+        while i < len(lines):
+            raw2 = lines[i]
+            offset += len(raw2)
+            i += 1
+            if close_re.match(raw2.rstrip("\r\n")):
+                closed = True
+                break
+        spans.append((start, offset if closed else len(text)))
+    return spans
 
 
 def marker_max() -> int:
@@ -777,7 +815,9 @@ def split_message(text: str) -> list[tuple[str, Any]]:
     index = key_index(stickers)
 
     masked = set()
-    for m in _FENCE_RE.finditer(text):
+    for start, end in _fenced_spans(text):        # 块围栏（CommonMark 边界）
+        masked.update(range(start, end))
+    for m in _INLINE_CODE_RE.finditer(text):      # 行内反引号跨度
         masked.update(range(m.start(), m.end()))
 
     parts: list[tuple[str, Any]] = []

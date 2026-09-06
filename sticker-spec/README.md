@@ -33,7 +33,7 @@ case 带 `known: {"<impl>": "原因"}` ＝该实现已知不符 spec 裁决：�
 | 1 | `kind` 非 sticker 的条目 | 不滤，photo 也进池 | 滤掉 | **不进贴纸车道**（photo 有自己的车道） | Python（`known.python` 在案） |
 | 2 | 变体选择符剥离 | VS15+VS16 都剥 | 只剥 VS16 | **两个都剥**（宽进） | TS（`known.ts` 在案） |
 | 3 | 标记内容长度上限 | 32 码位 | 16 码位（`u` 模式量词按码位） | **统一 32** | TS（`known.ts` 在案） |
-| 4 | 代码遮罩边界（多反引号/未闭合围栏/波浪线围栏） | ~~旧：`` ```.*?```|`[^`]*` `` 简易表达式，`` ``（😺）`` `` 里两个反引号各当成一段空代码、漏了中间~~ → 2026-09-07 修为按 Markdown 边界 | 待各自 runner 复核 | **按 Markdown 边界遮**：反引号跨度成对等长（N 开 N 闭）、围栏未闭合吃到文末、`~~~` 围栏同理——不用只认单/三反引号的简易表达式 | Python 已修（B8）；新增 `double_backtick_code_masked`/`quad_backtick_code_masked`/`tilde_fence_masked`/`unclosed_fence_masks_to_eof` 四条 fixtures，TS 侧本次离线未跑、跑到红即照裁决修 |
+| 4 | 代码遮罩边界（多反引号/围栏起止/波浪线围栏） | ~~旧：`` ```.*?```|`[^`]*` `` 简易表达式~~ → 2026-09-07 先修为 Markdown 边界（B8），同日再按 **CommonMark §4.5** 收严（R7） | 待各自 runner 复核 | **按 CommonMark §4.5 遮**：① 行内反引号跨度成对等长（N 开 N 闭）；② 块围栏**闭合可比起始更长**（同字符、长度 ≥ 起始），未闭合吃到文末，`~~~` 同理；③ **反引号起始围栏的 info string 不得含反引号**——含了就不是围栏、按行内代码处理（否则会把 `` ```code``` `` 这类行内代码当围栏起始、遮住后面正文） | Python 已修（B8+R7）；fixtures 现含 `double_backtick_code_masked`/`quad_backtick_code_masked`/`tilde_fence_masked`/`unclosed_fence_masks_to_eof`，R7 追加 `longer_closing_fence_then_marker`/`longer_closing_fence_masks_inside`/`inline_triple_backtick_then_marker` 三条（含「代码内不发＋代码外仍发」）；TS 侧本次离线未跑、跑到红即照裁决修 |
 
 不在 fixtures 覆盖内、属实现自由（暂不裁决，记录在案防误会）：
 

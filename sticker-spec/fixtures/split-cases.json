@@ -144,6 +144,32 @@
         "text:哈哈",
         "sticker:CODER"
       ]
+    },
+    {
+      "name": "longer_closing_fence_then_marker",
+      "input": "```\ncode\n````\n好（😢）",
+      "note": "CommonMark §4.5：闭合围栏可比起始更长（同字符、长度≥起始）。较长的 ```` 应闭合 ``` 围栏，其后的标记不在代码内、照常喷贴纸——不能把较长闭合当未闭合、吃到文末遮住后文。",
+      "expect": [
+        "text:```\ncode\n````\n好",
+        "sticker:CRY_A"
+      ]
+    },
+    {
+      "name": "longer_closing_fence_masks_inside",
+      "input": "```\n（😢）\n````\n尾巴",
+      "note": "同上：块内的标记仍被遮住（不发），整段是纯文本。",
+      "expect": [
+        "text:```\n（😢）\n````\n尾巴"
+      ]
+    },
+    {
+      "name": "inline_triple_backtick_then_marker",
+      "input": "```x``` 好（😢）",
+      "note": "反引号起始围栏的 info string 不得含反引号（CommonMark §4.5）——```x``` 是行内代码不是块围栏起始，只遮代码本身，后面正文照常喷贴纸。",
+      "expect": [
+        "text:```x``` 好",
+        "sticker:CRY_A"
+      ]
     }
   ]
 }
