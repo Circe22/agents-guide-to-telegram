@@ -444,9 +444,27 @@ class TestSplitMessage(Base):
         parts = tg_sticker.split_message("语法是 `（😾）` 这样")
         self.assertEqual([k for k, _ in parts], ["text"])
 
+    def test_double_backtick_exempt(self):
+        # B8：成对等长的反引号串是一个代码跨度，中间不喷贴纸
+        # 反向变异：把 _FENCE_RE 换回 ```.*?```|`[^`\n]*` ，本测试转红
+        text = "``（😾）``"
+        self.assertEqual(tg_sticker.split_message(text), [("text", text)])
+
+    def test_quad_backtick_exempt(self):
+        text = "````（😾）````"
+        self.assertEqual(tg_sticker.split_message(text), [("text", text)])
+
     def test_fence_exempt(self):
         parts = tg_sticker.split_message("```\n（😾）\n```")
         self.assertEqual([k for k, _ in parts], ["text"])
+
+    def test_tilde_fence_exempt(self):
+        text = "~~~\n（😾）\n~~~"
+        self.assertEqual([k for k, _ in tg_sticker.split_message(text)], ["text"])
+
+    def test_unclosed_fence_masks_to_eof(self):
+        # 未闭合围栏吃到文末，里面的表情不喷贴纸
+        self.assertEqual([k for k, _ in tg_sticker.split_message("```\n（😾）")], ["text"])
 
     def test_halfwidth_parens(self):
         self.assertEqual(self.kinds("好气(😾)"), ["text", "sticker"])

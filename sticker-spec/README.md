@@ -33,6 +33,7 @@ case 带 `known: {"<impl>": "原因"}` ＝该实现已知不符 spec 裁决：�
 | 1 | `kind` 非 sticker 的条目 | 不滤，photo 也进池 | 滤掉 | **不进贴纸车道**（photo 有自己的车道） | Python（`known.python` 在案） |
 | 2 | 变体选择符剥离 | VS15+VS16 都剥 | 只剥 VS16 | **两个都剥**（宽进） | TS（`known.ts` 在案） |
 | 3 | 标记内容长度上限 | 32 码位 | 16 码位（`u` 模式量词按码位） | **统一 32** | TS（`known.ts` 在案） |
+| 4 | 代码遮罩边界（多反引号/未闭合围栏/波浪线围栏） | ~~旧：`` ```.*?```|`[^`]*` `` 简易表达式，`` ``（😺）`` `` 里两个反引号各当成一段空代码、漏了中间~~ → 2026-09-07 修为按 Markdown 边界 | 待各自 runner 复核 | **按 Markdown 边界遮**：反引号跨度成对等长（N 开 N 闭）、围栏未闭合吃到文末、`~~~` 围栏同理——不用只认单/三反引号的简易表达式 | Python 已修（B8）；新增 `double_backtick_code_masked`/`quad_backtick_code_masked`/`tilde_fence_masked`/`unclosed_fence_masks_to_eof` 四条 fixtures，TS 侧本次离线未跑、跑到红即照裁决修 |
 
 不在 fixtures 覆盖内、属实现自由（暂不裁决，记录在案防误会）：
 

@@ -26,10 +26,41 @@
       ]
     },
     {
+      "name": "double_backtick_code_masked",
+      "input": "``（😢）``",
+      "note": "成对等长的反引号串是一个代码跨度，中间的表情要遮住——不是把边界两个反引号各当成一段空代码、漏了中间（spec 裁决：按 Markdown 边界）。",
+      "expect": [
+        "text:``（😢）``"
+      ]
+    },
+    {
+      "name": "quad_backtick_code_masked",
+      "input": "````（😢）````",
+      "expect": [
+        "text:````（😢）````"
+      ]
+    },
+    {
       "name": "fence_masked",
       "input": "```\n（😢）\n```\n好",
       "expect": [
         "text:```\n（😢）\n```\n好"
+      ]
+    },
+    {
+      "name": "tilde_fence_masked",
+      "input": "~~~\n（😢）\n~~~\n好",
+      "note": "波浪线围栏也照 Markdown 边界遮。",
+      "expect": [
+        "text:~~~\n（😢）\n~~~\n好"
+      ]
+    },
+    {
+      "name": "unclosed_fence_masks_to_eof",
+      "input": "```\n（😢）",
+      "note": "未闭合的围栏按 Markdown 吃到文末，里面的表情不喷贴纸。",
+      "expect": [
+        "text:```\n（😢）"
       ]
     },
     {
