@@ -875,6 +875,68 @@ class OrphanStickerGuard(unittest.TestCase):
         self.assertIn('"message_id": 42', data.get("reply_parameters", ""))
 
 
+class MarkerPathContract(unittest.TestCase):
+    """B7：命中贴纸标记的分支不许改变参数合同——先公共校验，silent/rtl 共享。
+
+    反向变异：把 tool_send 里 build_rich 移回贴纸分支之后 → 校验前置失效，
+    test_invalid_combo_rejected_before_send 转红；去掉 send_entry 的 silent 透传
+    或分段正文的 is_rtl → 对应测试转红。
+    """
+
+    def setUp(self):
+        from test_tg_sticker import make_library
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["TG_STICKER_DIR"] = self.tmp.name
+        make_library(Path(self.tmp.name))
+        self.had = {k: os.environ.get(k) for k in ("TG_CHAT_ID", "TG_BOT_TOKEN")}
+        os.environ["TG_CHAT_ID"] = "-100555"
+        os.environ["TG_BOT_TOKEN"] = FAKE_TOKEN
+        self.calls = []
+        self.original = mcp.call_api
+
+        def fake(method, data, files=None):
+            self.calls.append((method, dict(data)))
+            return {"ok": True, "result": {
+                "message_id": len(self.calls),
+                "sticker": {"file_id": "FRESH", "file_unique_id": "UNIQ2"}}}
+
+        mcp.call_api = fake
+        mcp._LAST_SENT.clear()
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        os.environ.pop("TG_STICKER_DIR", None)
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        mcp._LAST_SENT.clear()
+        self.tmp.cleanup()
+
+    def test_invalid_combo_rejected_before_send(self):
+        # markdown+html 命中贴纸标记：本该三选一报错，绝不因命中贴纸而放行发送
+        result = call_tool("tg_rich_send", {"markdown": "hi（😭）", "html": "<b>x</b>"})
+        self.assertTrue(result["result"]["isError"])
+        self.assertIn("三选一", result["result"]["content"][0]["text"])
+        self.assertEqual(self.calls, [], "非法请求不该有任何发送副作用")
+
+    def test_silent_reaches_stickers(self):
+        mcp.tool_send({"markdown": "hi（😭）", "silent": True})
+        sticker_calls = [d for m, d in self.calls if m == "sendSticker"]
+        self.assertTrue(sticker_calls, "贴纸没发出去")
+        self.assertEqual(sticker_calls[0].get("disable_notification"), "true")
+        # 文字段也应静默
+        text_calls = [d for m, d in self.calls if m == "sendRichMessage"]
+        self.assertEqual(text_calls[0].get("disable_notification"), "true")
+
+    def test_rtl_reaches_segmented_text(self):
+        mcp.tool_send({"markdown": "hi（😭）", "rtl": True})
+        text_calls = [d for m, d in self.calls if m == "sendRichMessage"]
+        rich = json.loads(text_calls[0]["rich_message"])
+        self.assertTrue(rich.get("is_rtl"))
+
+
 class PartialSendLedger(unittest.TestCase):
     """B2：分段发送后段失败，前段已送达的 message_id 绝不能从错误里丢。
 

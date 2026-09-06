@@ -468,11 +468,15 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
     text_delivered = False
     held: list[tuple[int, Any]] = []       # 正文落地前挂起的贴纸段（带段号）
 
+    silent = bool(args.get("silent"))
+    is_rtl = bool(args.get("rtl"))
+
     def _fire(seg: int, payload: Any) -> None:
         pool, combo, raw = payload
         try:
             entry = tg_sticker.pick(pool, combo)
-            tg_sticker.send_entry(entry, chat, token, call_api)
+            # 贴纸与分段正文共享发送选项：silent 也要传给 sendSticker（B7）
+            tg_sticker.send_entry(entry, chat, token, call_api, silent=silent)
             lines.append(f"贴纸「{entry.get('title')}」← 标记 {raw}")
             delivered.append({"seg": seg, "kind": "sticker",
                               "title": str(entry.get("title") or ""), "marker": raw})
@@ -492,11 +496,15 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
 
     for seg, (kind, payload) in enumerate(plan, 1):
         if kind == "text":
+            # rtl 也要跟着分段正文走，别因命中贴纸分支就丢了（B7）
+            rich_msg: dict[str, Any] = {"markdown": payload}
+            if is_rtl:
+                rich_msg["is_rtl"] = True
             data: dict[str, Any] = {
                 "chat_id": chat,
-                "rich_message": json.dumps({"markdown": payload}, ensure_ascii=False),
+                "rich_message": json.dumps(rich_msg, ensure_ascii=False),
             }
-            if args.get("silent"):
+            if silent:
                 data["disable_notification"] = "true"
             if not text_delivered and reply_to:
                 data["reply_parameters"] = json.dumps({"message_id": reply_to})
@@ -531,6 +539,10 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
 
 
 def tool_send(args: dict[str, Any]) -> str:
+    # 公共校验先行：三选一的约束在**任何发送之前**守（build_rich），命中贴纸
+    # 分支不该改变参数合同——同样的输入不能因库里有没有那张脸而校验结果不同（B7）。
+    rich = build_rich(args)
+
     # 渲染器模式的第二层：markdown 正文里的（emoji）标记剥成真贴纸，
     # 写到哪儿贴纸跟在哪条后面（位置即语义）。库为空/标记没命中时零开销、零改动。
     markdown_raw = str(args.get("markdown") or "")
@@ -539,7 +551,6 @@ def tool_send(args: dict[str, Any]) -> str:
         if any(kind == "sticker" for kind, _ in parts):
             return _send_with_stickers(parts, args)
 
-    rich = build_rich(args)
     media = None
     if args.get("media_paths"):
         if "blocks" not in rich:

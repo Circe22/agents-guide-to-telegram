@@ -336,20 +336,25 @@ def _archive_file(entry: dict[str, Any]) -> Path:
 
 
 def send_entry(entry: dict[str, Any], chat_id: str, token: str,
-               api: Callable[..., dict[str, Any]]) -> str:
-    """v3 懒迁移：本 bot 缓存 → 400 才重传归档原图 → 新 file_id 写回缓存。"""
+               api: Callable[..., dict[str, Any]], silent: bool = False) -> str:
+    """v3 懒迁移：本 bot 缓存 → 400 才重传归档原图 → 新 file_id 写回缓存。
+
+    `silent`＝静默发送：与分段正文共享同一个发送选项，别让"命中贴纸分支"把
+    disable_notification 丢掉（B7）。
+    """
     unique = str(entry.get("file_unique_id") or "")
+    quiet = {"disable_notification": "true"} if silent else {}
     cached = load_cache(token).get(unique) if unique else None
     if cached:
         try:
-            api("sendSticker", {"chat_id": chat_id, "sticker": cached})
+            api("sendSticker", {"chat_id": chat_id, "sticker": cached, **quiet})
             return f"贴纸已发：{entry.get('title')}（{entry.get('emoji')}）"
         except ApiRejected as exc:
             if not _looks_file_id_400(exc):
                 raise      # 非 400，或 400 但不关 file_id 的事（chat 错/参数错）
             # 文案点名 file_id 失效（换过 token 等），才走归档重传
     real = _archive_file(entry)
-    payload = api("sendSticker", {"chat_id": chat_id},
+    payload = api("sendSticker", {"chat_id": chat_id, **quiet},
                   files={"sticker": (real.name, real.read_bytes())})
     result = payload.get("result") or {}
     fresh = ((result.get("sticker") or {}).get("file_id")
