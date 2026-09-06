@@ -67,19 +67,35 @@ Telegram 在 Bot API **10.1**（2026-06-11）加了 Rich Messages，10.2（07-14
 
 ### 1. 配置
 
+不走代理的最小配置（可直接复制）：
+
 ```bash
 cat > ~/.tg-rich-mcp.json <<'JSON'
 {
   "bot_token": "123456:AA...",
-  "chat_id": "你的 chat id",
-  "proxy": "http://127.0.0.1:7897"
+  "chat_id": "你的 chat id"
 }
 JSON
 chmod 600 ~/.tg-rich-mcp.json
 ```
 
-`proxy` 不需要就删掉那行。也支持环境变量 `TG_BOT_TOKEN` / `TG_CHAT_ID` / `TG_PROXY`（优先级更高）。
+要走代理就**加一行** `"proxy"`——JSON 不允许尾逗号，所以给它**前面**那行（`chat_id`）
+补上一个逗号：
+
+```json
+{
+  "bot_token": "123456:AA...",
+  "chat_id": "你的 chat id",
+  "proxy": "http://127.0.0.1:7897"
+}
+```
+
+反过来，要删掉末尾某个字段（如 proxy），记得连同**上一行的逗号**一起删，别留下
+`"chat_id": "…",` 这种悬着的尾逗号——那是不合法的 JSON。也支持环境变量
+`TG_BOT_TOKEN` / `TG_CHAT_ID` / `TG_PROXY`（优先级更高）。
 配置在进程启动时读一次并缓存，**改了要重启 MCP server 才生效**。
+配置文件**不存在**时静默按"没配"处理；**存在但格式错误**会往 stderr 打一行脱敏诊断
+（不吞掉、也不把 token 带出来），免得只看到"没找到 token"却不知道是 JSON 写坏了。
 
 > **想用进度窗 hook 的话，必须用配置文件**（或把变量 export 进编辑器的启动环境）——
 > hook 是编辑器另起的进程，拿不到你写在 MCP server 那段 `env` 里的变量。

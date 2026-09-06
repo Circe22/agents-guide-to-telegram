@@ -436,6 +436,49 @@ class FrameOrdering(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["msg_id"], 42)
 
 
+class ConfigDiagnostics(unittest.TestCase):
+    """配置：无代理示例可直接删 proxy 而不留尾逗号；坏 JSON 给脱敏诊断、缺文件静默。"""
+
+    def _cache(self):
+        return mcp._file_config.__defaults__[0]
+
+    def test_readme_config_example_valid_without_proxy(self):
+        # README 的首个 JSON heredoc 删掉任何 "proxy" 行后仍是合法 JSON（坑：尾逗号）
+        readme = (Path(mcp.__file__).parent / "README.md").read_text(encoding="utf-8")
+        example = readme.split("<<'JSON'\n", 1)[1].split("\nJSON", 1)[0]
+        without_proxy = "\n".join(l for l in example.splitlines() if '"proxy"' not in l)
+        result = json.loads(without_proxy)   # 不合法就抛，测试红
+        self.assertIn("bot_token", result)
+
+    def test_malformed_config_emits_redacted_diagnostic(self):
+        import io
+        from unittest.mock import patch as _p
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "c.json"
+            cfg.write_text('{"bot_token":"SECRETTOKEN","chat_id":"y",}')  # 尾逗号
+            self._cache().clear()
+            err = io.StringIO()
+            with _p.object(mcp, "CONFIG_PATH", cfg), _p.object(sys, "stderr", err):
+                result = mcp._file_config()
+            self._cache().clear()
+        self.assertEqual(result, {}, "坏配置应按无配置处理，不崩")
+        self.assertIn("不是合法 JSON", err.getvalue(), "坏 JSON 该给诊断")
+        self.assertNotIn("SECRETTOKEN", err.getvalue(), "诊断不许带出内容/token")
+
+    def test_missing_config_is_silent(self):
+        import io
+        from unittest.mock import patch as _p
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "nope.json"   # 不存在
+            self._cache().clear()
+            err = io.StringIO()
+            with _p.object(mcp, "CONFIG_PATH", cfg), _p.object(sys, "stderr", err):
+                result = mcp._file_config()
+            self._cache().clear()
+        self.assertEqual(result, {})
+        self.assertEqual(err.getvalue(), "", "缺配置文件应静默")
+
+
 @needs_hook
 class EditErrorClassification(unittest.TestCase):
     """B4：进度窗只在**确认消息已不存在**时弃窗；超时/429/5xx 保留窗口。

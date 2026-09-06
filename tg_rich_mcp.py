@@ -81,12 +81,28 @@ CONFIG_PATH = Path.home() / ".tg-rich-mcp.json"
 
 
 def _file_config(_cache: dict[str, Any] = {}) -> dict[str, Any]:
-    """读 ~/.tg-rich-mcp.json。读不到就当空——缺配置不该让进程起不来。"""
+    """读 ~/.tg-rich-mcp.json。读不到就当空——缺配置不该让进程起不来。
+
+    文件**不存在**＝静默按"没配"处理；**存在但 JSON 写坏了**＝往 stderr 打一行
+    脱敏诊断（只报错误类型与行列，绝不带出内容/token），否则用户只看到"没找到
+    token"、却不知道是配置文件写坏了（常见：删字段时留了尾逗号）。
+    stdout 是 JSON-RPC 通道，诊断只能走 stderr。
+    """
     if "v" not in _cache:
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            _cache["v"] = data if isinstance(data, dict) else {}
+            raw = CONFIG_PATH.read_text(encoding="utf-8")
         except Exception:
+            _cache["v"] = {}          # 不存在/读不了：静默
+            return _cache["v"]
+        try:
+            data = json.loads(raw)
+            _cache["v"] = data if isinstance(data, dict) else {}
+        except json.JSONDecodeError as exc:
+            sys.stderr.write(
+                f"[tg-rich] {CONFIG_PATH} 不是合法 JSON（{type(exc).__name__}: "
+                f"line {exc.lineno} col {exc.colno}），已按无配置处理；"
+                "常见原因：删字段时留了尾逗号。\n"
+            )
             _cache["v"] = {}
     return _cache["v"]
 
