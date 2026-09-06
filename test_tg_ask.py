@@ -345,6 +345,51 @@ class ChoiceFlow(unittest.TestCase):
                 {"question": "q", "options": ["A"], "timeout_s": 5}, "8888", broken
             )
 
+    # ---- B9：发题成功后轮询异常，也要 best-effort 收卡 ----
+    def _poll_dies_api(self, calls, settle_fails=False):
+        """_drain 那次放行；发题后第一次轮询就炸——模拟中途网络/409。"""
+        def api(method, data, files=None):
+            calls.append((method, dict(data)))
+            if method == "getUpdates":
+                if any(m == "sendMessage" for m, _ in calls):
+                    raise RuntimeError("simulated polling timeout")
+                return {"result": []}
+            if method == "editMessageText" and settle_fails:
+                raise RuntimeError("settle also broke")
+            return {"result": {"message_id": 111}}
+        return api
+
+    def test_poll_error_settles_card_and_raises_with_id(self):
+        # 反向变异：去掉 tool_ask_choice 里 _wait_click 的 try/except → 卡不收，本测试转红
+        calls = []
+        with self.assertRaises(RuntimeError) as ctx:
+            tg_ask.tool_ask_choice(
+                {"question": "q", "options": ["A", "B"]}, "8888",
+                self._poll_dies_api(calls))
+        methods = [m for m, _ in calls]
+        self.assertIn("editMessageText", methods, "轮询炸了却没收卡，留了幽灵按钮")
+        self.assertIn("111", str(ctx.exception), "失败响应要带题目 message_id")
+
+    def test_mark_answered_false_skips_settle_but_still_raises(self):
+        calls = []
+        with self.assertRaises(RuntimeError) as ctx:
+            tg_ask.tool_ask_choice(
+                {"question": "q", "options": ["A", "B"], "mark_answered": False},
+                "8888", self._poll_dies_api(calls))
+        methods = [m for m, _ in calls]
+        self.assertNotIn("editMessageText", methods,
+                         "mark_answered=False 说自己管卡，不该替它收")
+        self.assertIn("111", str(ctx.exception))
+
+    def test_settle_failure_does_not_mask_original_error(self):
+        calls = []
+        with self.assertRaises(RuntimeError) as ctx:
+            tg_ask.tool_ask_choice(
+                {"question": "q", "options": ["A", "B"]}, "8888",
+                self._poll_dies_api(calls, settle_fails=True))
+        self.assertIn("simulated polling timeout", str(ctx.exception),
+                      "收卡失败盖住了原始轮询错误")
+
     def test_nonce_unique_per_question(self):
         api1 = FakeApi(plan=[[], lambda a: [a.click(0)]])
         api2 = FakeApi(plan=[[], lambda a: [a.click(0)]])

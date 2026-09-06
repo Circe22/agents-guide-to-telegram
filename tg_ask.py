@@ -288,9 +288,23 @@ def tool_ask_choice(args: dict[str, Any], chat: str, call_api: CallApi) -> str:
 
     _drain(call_api)
     message_id = _send_card(call_api, chat, body, keyboard)
-    index = _wait_click(
-        call_api, nonce, chat, len(labels), time.time() + timeout_s
-    )
+    try:
+        index = _wait_click(
+            call_api, nonce, chat, len(labels), time.time() + timeout_s
+        )
+    except Exception as exc:
+        # 轮询中途炸了（网络/中途 409）：卡还挂着按钮、没人再等＝幽灵按钮。
+        # best-effort 收卡（尊重 mark_answered=False：它说自己管卡就别碰）；
+        # 收卡失败**吞掉**、不得掩盖原始错误；失败响应带上 message_id 和作废状态。
+        if mark:
+            try:
+                _settle_card(call_api, chat, message_id,
+                             f"{body}\n\n⚠️ 等点击时出错（按钮已失效）")
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"等点击时出错（message_id: {message_id}，按钮已作废）：{exc}"
+        ) from exc
     if index is None:
         if mark:
             _settle_card(call_api, chat, message_id,
