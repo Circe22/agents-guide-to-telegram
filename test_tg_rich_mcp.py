@@ -783,27 +783,56 @@ class MediaUpload(unittest.TestCase):
         self.assertIn("总预算", str(ctx.exception))
 
     def test_growth_during_read_still_rejected(self):
-        """B3：stat 骗过闸、read 时文件长大——按实际字节再验单文件上限，仍拒。
+        """B3/R6：stat 骗过闸、read 时文件长大——按实际字节再验，仍拒，且**有界读取**。
 
-        反向变异：去掉读后的 `len(blob) > cap` 复验，本测试转红（32 字节被接收）。
+        注入点从 read_bytes 移到 open：R6 后实现用 `real.open('rb')` 只读 cap+1 字节、
+        不再走无上限 read_bytes，所以增长要钩在 open 上。除了「仍拒」，还验证拒绝发生在
+        **只读了 cap+1 字节之后**，没有先把撑大的整份读进内存（收编审查反例
+        test_growth_read_is_bounded_before_allocating 的业务结果——那支反例把增长钩在
+        read_bytes 上，与「有界读必须避开 read_bytes」互斥，故按工单调整注入点、
+        保留所验证的业务结果）。
+
+        反向变异：把 load_media 的 `fh.read(cap + 1)` 换回 `real.read_bytes()`，
+        `measured` 会记到整份 2 MiB，有界断言转红。
         """
         from unittest.mock import patch as _p
         photo = self.dir / "g.webp"
         photo.write_bytes(b"x")
-        real_rb = Path.read_bytes
+        real_open = Path.open
+        measured: list[int] = []
 
-        def growing(path):
-            # 按文件名命中，不用 == 全等：实现读的是 resolve() 后的路径，
-            # Windows 上 temp 目录经 resolve 会展开 8.3 短路径/统一盘符大小写，
-            # 与未 resolve 的 photo 不相等，钩子落空 → 文件没长大 → 测试假绿。
-            if path.name == photo.name:
-                photo.write_bytes(b"x" * 32)   # stat 时 1 字节，读之前长到 32
-            return real_rb(path)
+        class _Counting:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def read(self, n=-1):
+                data = self._fh.read(n)
+                measured.append(len(data))
+                return data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self._fh.close()
+
+        def grow_then_open(self, *a, **k):
+            # 按文件名命中（实现读的是 resolve() 后的路径，Windows 上未必与 photo 全等）。
+            mode = a[0] if a else k.get("mode", "r")
+            if self.name == photo.name and "b" in mode and "r" in mode:
+                # stat 时 1 字节，读之前（open 时）撑到 2 MiB。用原始 open 写，避免递归。
+                with real_open(photo, "wb") as g:
+                    g.write(b"x" * (2 * 1024 * 1024))
+                return _Counting(real_open(self, *a, **k))
+            return real_open(self, *a, **k)
 
         with _p.object(mcp, "MEDIA_MAX_BYTES", 8), \
-                _p.object(Path, "read_bytes", growing):
+                _p.object(Path, "open", grow_then_open):
             with self.assertRaises(ValueError):
                 mcp.load_media([str(photo)])
+        self.assertTrue(measured, "有界读取没走到 open 钩子")
+        self.assertLessEqual(sum(measured), 8 + 1,
+                             f"文件在 stat 后长大，却先整读了 {sum(measured)} 字节才拒绝")
 
 
 @needs_hook

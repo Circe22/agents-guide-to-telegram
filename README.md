@@ -373,7 +373,7 @@ tg_rich_send(
 - 第 i 个路径＝`attach://f{i}`。`collage` 换成 `slideshow` 就是左右翻页；
   单个 `photo` 块就是普通发图。一条消息最多 50 个媒体。**三个"上限"不是一回事，别混**：
   - **本地拦截阈值**：本工具对每个文件按 50 MiB 拦（`MEDIA_MAX_BYTES`），是内存/误传保护，不是 Telegram 的承诺；
-  - **累计输入预算**：一次调用所有文件读进内存拼 multipart 的总量，默认 200 MiB（`TG_RICH_MEDIA_TOTAL_MB` 可调）；
+  - **累计输入预算**：一次调用所有文件读进内存拼 multipart 的总量，默认 200 MiB（`TG_RICH_MEDIA_TOTAL_MB` 可调）。读取本身**有界**——每个文件最多只读「单文件上限与剩余预算取小」再 +1 字节（多那一字节用来判超限），所以就算文件在 stat 之后被撑大，也不会先把整份读进内存再事后拒绝。这道界约束的是**文件输入字节**，不等于封顶整体 RSS（拼 multipart、`requests` 缓冲另有开销）；
   - **Telegram 自己的类型上限**：走 multipart 上传，**照片 10MB、其它文件 50MB**（[Sending Files](https://core.telegram.org/bots/api#sending-files)）。所以一张 50MB 的"照片"过得了本地阈值，却发不出去——别把"≤50MB"当成任意图片都能发。
 - 发送成功的返回里带每个媒体的 **file_id**。存下来，下次 `media` 直接填
   file_id 复用，不用重新上传。**复用时整串程序化取用，别看着截断的显示手补

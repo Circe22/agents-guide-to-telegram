@@ -241,10 +241,12 @@ def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
         cap = min(MEDIA_MAX_BYTES, budget - total)
         if stat_size > cap:
             raise _budget_error(i, path.name, stat_size, total, budget)
-        # stat 与 read 之间文件可能又长了（TOCTOU）：读完按**实际字节**再验两道闸，
-        # 别让 stat 骗过去。这类增长罕见、增量有限；真要严丝合缝可改临时文件流式，
-        # 「定长」不要求全部内容驻留内存。文档区分了输入字节预算/请求体/进程内存。
-        blob = real.read_bytes()
+        # stat 与 read 之间文件可能又长了（TOCTOU）：读也**有界**——最多取 cap+1 字节，
+        # 多出的那一字节用来判超限（R6）。这样即便文件在 stat 之后被撑大，也不会先把整份
+        # 读进内存、再事后报错——事后报错约束不了已经发生的分配。有界的是**文件输入
+        # 预算**（本文件 cap+1）；这不等于封顶整体 RSS（拼 multipart、requests 缓冲另有开销）。
+        with real.open("rb") as fh:
+            blob = fh.read(cap + 1)
         if len(blob) > cap:
             raise _budget_error(i, path.name, len(blob), total, budget)
         total += len(blob)
