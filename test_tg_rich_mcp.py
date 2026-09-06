@@ -792,8 +792,11 @@ class MediaUpload(unittest.TestCase):
         real_rb = Path.read_bytes
 
         def growing(path):
-            if path == photo:
-                path.write_bytes(b"x" * 32)   # stat 时 1 字节，读之前长到 32
+            # 按文件名命中，不用 == 全等：实现读的是 resolve() 后的路径，
+            # Windows 上 temp 目录经 resolve 会展开 8.3 短路径/统一盘符大小写，
+            # 与未 resolve 的 photo 不相等，钩子落空 → 文件没长大 → 测试假绿。
+            if path.name == photo.name:
+                photo.write_bytes(b"x" * 32)   # stat 时 1 字节，读之前长到 32
             return real_rb(path)
 
         with _p.object(mcp, "MEDIA_MAX_BYTES", 8), \
