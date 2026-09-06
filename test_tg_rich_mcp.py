@@ -1070,8 +1070,10 @@ class StopVsInflightPushFence(unittest.TestCase):
 
     def test_stale_edit_failure_cannot_wipe_new_round(self):
         # 编辑失败的让位补丁也要过栅栏：旧轮的「松手」不许清掉新一轮的窗。
-        # 关键在时序——push 必须在 finish **之前**读走旧账（gen=0）并卡在编辑上，
-        # 等 finish 开出新一轮（gen=1、开了 55 号窗）后才失败让位。
+        # 关键在时序——push 必须先读走旧账（gen=0）并卡在编辑上，等新一轮
+        # 开出来（gen=1、开了 55 号窗）后才失败让位。
+        # 失败必须是**确认消息没了**（B4 之后只有这类才触发清窗）；用 _amend 直接
+        # 模拟新一轮（不走 _finish_session，避开它把清理排到推送锁尾的等待）。
         import threading
         path = self._seed(msg_id=42)          # 旧轮：有窗可编辑
         edit_started = threading.Event()
@@ -1082,20 +1084,109 @@ class StopVsInflightPushFence(unittest.TestCase):
             if method == "editMessageText":
                 edit_started.set()
                 release_edit.wait(5)
-                raise RuntimeError("消息没了")
+                raise mcp.ApiRejected("Bad Request: message to edit not found", 400)
             return {"result": {"message_id": 77}}
 
         mcp.call_api = flaky
         worker = threading.Thread(target=hook._push, args=(path, 1))
         worker.start()
         self.assertTrue(edit_started.wait(5), "edit 没起飞，测试环境不对")
-        hook._finish_session("s1")                                   # gen 0→1
-        hook._amend(path, {"msg_id": 55, "claim": 7, "claim_at": 1.0})  # 新一轮已开窗
+        # 新一轮：bump gen + 开 55 号窗（_amend 走 state 锁，不与 push 持的推送锁抢）
+        hook._amend(path, {"gen": 1, "msg_id": 55, "claim": 7, "claim_at": 1.0})
         release_edit.set()
         worker.join(5)
         state = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(int(state.get("msg_id") or 0), 55,
                          "旧轮 push 把新一轮的窗清掉了")
+
+
+@needs_hook
+class StopLifecycleAcrossModes(unittest.TestCase):
+    """B5：Stop 的代际保护要覆盖 keep 的晚归编辑与 draft 的排队推送。
+
+    - keep：Stop 的"干完了"最终编辑与在飞的旧帧共用推送锁，必须排在旧帧之后，
+      否则旧帧晚归把窗口改回"正在干活…"。
+    - draft：Stop 清空并 bump seq/gen 后，排队的旧 draft 子进程必须让位，
+      不能再喷一帧"正在干活/0步"。
+
+    反向变异：keep — 去掉 _finish_session 第二步的推送锁包裹，
+    test_keep_final_edit_lands_after_inflight 转红；
+    draft — 把 _finish_session 第一步的 seq/sched_seq bump 拿掉，
+    test_queued_draft_yields_after_finish 转红。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_dir = hook.STATE_DIR
+        hook.STATE_DIR = Path(self.tmp.name)
+        self.had = {k: os.environ.get(k) for k in
+                    ("TG_CHAT_ID", "TG_PROGRESS_MODE", "TG_PROGRESS_END")}
+        os.environ["TG_CHAT_ID"] = "888"
+        self.original = mcp.call_api
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        hook.STATE_DIR = self.old_dir
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _seed(self, **extra):
+        import time as _t
+        state = {"seq": 1, "gen": 0, "claim": 1, "claim_at": _t.time(),
+                 "msg_id": 42, "lines": ["⚡ Bash"], "total": 1,
+                 "last_push": _t.time(), "draft_id": 9}
+        state.update(extra)
+        path = hook._state_path("s5")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        return path
+
+    def test_keep_final_edit_lands_after_inflight(self):
+        import threading
+        os.environ["TG_PROGRESS_MODE"] = "edit"
+        os.environ["TG_PROGRESS_END"] = "keep"
+        path = self._seed()
+        started, hold = threading.Event(), threading.Event()
+        applied = []
+
+        def api(method, data, files=None):
+            if method == "editMessageText":
+                heading = json.loads(data["rich_message"])["blocks"][0]["text"]
+                if heading == hook.TITLE:
+                    started.set()
+                    hold.wait(3)            # 旧帧卡在编辑里、握着推送锁
+                applied.append(heading)
+            return {"ok": True, "result": {}}
+
+        mcp.call_api = api
+        push = threading.Thread(target=hook._push, args=(path, 1))
+        push.start()
+        self.assertTrue(started.wait(3), "旧帧没起飞")
+        # finish 放到线程里，好让主线程放行旧帧——不把 release 绑在 finish 返回上，
+        # 于是不依赖被审提交的内部时序（是稳定并发测试，不是屏障钩子照搬）。
+        finisher = threading.Thread(target=hook._finish_session, args=("s5",))
+        finisher.start()
+        import time as _t
+        _t.sleep(0.05)                      # 让 finish 先卡在推送锁上
+        hold.set()                          # 放行旧帧：发 TITLE、放锁
+        push.join(3)
+        finisher.join(3)
+        self.assertEqual(applied, [hook.TITLE, hook.DONE_TITLE],
+                         f"最终编辑没排到在飞旧帧之后：{applied}")
+
+    def test_queued_draft_yields_after_finish(self):
+        os.environ["TG_PROGRESS_MODE"] = "draft"
+        path = self._seed(msg_id=0)
+        calls = []
+        mcp.call_api = lambda *a, **k: (calls.append(a[0]), {"result": True})[1]
+        hook._finish_session("s5")
+        hook._push(path, 1)                 # 排队的旧 draft 子进程
+        self.assertEqual(calls, [],
+                         "Stop 后排队的旧 draft 还喷了一帧空草稿")
 
 
 if __name__ == "__main__":

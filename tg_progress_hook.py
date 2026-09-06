@@ -488,8 +488,13 @@ def _finish_session(session: str) -> int:
             message_id = int(state.get("msg_id") or 0)
             lines = state.get("lines") or []
             total = int(state.get("total") or 0)
+            # 关账要**同时废掉旧 seq**：光 bump gen 挡不住排队/在飞的推送——draft 路径
+            # 只比 seq，Stop 后排队的子进程读到同一个 seq 仍会喷一帧"正在干活/0步"（B5）。
+            # seq 与 sched_seq 一起推高 → 任何旧 seq 的推送经 _superseded 让位。
+            new_seq = int(state.get("seq") or 0) + 1
             state.update({
                 "gen": int(state.get("gen") or 0) + 1,
+                "seq": new_seq, "sched_seq": new_seq,
                 "msg_id": 0, "claim": 0, "claim_at": 0.0,
                 "lines": [], "total": 0, "last_push": 0.0,
             })
@@ -508,20 +513,26 @@ def _finish_session(session: str) -> int:
         chat = _default_chat()
         if not chat:
             return 0
-        gone = False
-        if _end_mode() == "delete":
-            try:
-                call_api("deleteMessage",
-                         {"chat_id": chat, "message_id": message_id})
-                gone = True
-            except Exception:
-                gone = False       # 超 48 小时删不掉，退回定格
-        if not gone:
-            call_api("editMessageText", {
-                "chat_id": chat,
-                "message_id": message_id,
-                "rich_message": _rich(_blocks(lines, total, done=True)),
-            })
+        # 最终网络清理与普通推送**共用推送锁**：排在任何在飞的推送之后，免得晚归的
+        # 旧帧把"干完了"覆盖回"正在干活…"（B5·keep 旧编辑晚归）。关账已在第一步的
+        # state 锁里完成、主体没被网络拖慢；这里只是把清理排到推送队列尾。
+        lock_path = Path(str(state_path) + ".push.lock")
+        with open(str(lock_path), "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            gone = False
+            if _end_mode() == "delete":
+                try:
+                    call_api("deleteMessage",
+                             {"chat_id": chat, "message_id": message_id})
+                    gone = True
+                except Exception:
+                    gone = False       # 超 48 小时删不掉，退回定格
+            if not gone:
+                call_api("editMessageText", {
+                    "chat_id": chat,
+                    "message_id": message_id,
+                    "rich_message": _rich(_blocks(lines, total, done=True)),
+                })
     except Exception:
         pass
     return 0
