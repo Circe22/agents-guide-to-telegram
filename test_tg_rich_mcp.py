@@ -713,6 +713,51 @@ class MediaUpload(unittest.TestCase):
         finally:
             os.environ.pop("TG_RICH_MEDIA_TOTAL_MB", None)
 
+    def test_oversize_file_is_not_read_into_memory(self):
+        """B3：超预算的文件按 stat 预检直接拒，一个字节都不读进内存。
+
+        反向变异：把 load_media 的 stat 预检去掉、先 read_bytes 再判预算，
+        本测试转红（read_bytes 被调用、reads 非空）。
+        """
+        from unittest.mock import patch as _p
+        big = self.img("big.jpg", b"x" * (2 * 1024 * 1024))   # 2MB
+        reads = []
+        real_rb = Path.read_bytes
+
+        def spy(path):
+            reads.append(str(path))
+            return real_rb(path)
+
+        os.environ["TG_RICH_MEDIA_TOTAL_MB"] = "1"
+        try:
+            with _p.object(Path, "read_bytes", spy):
+                with self.assertRaises(ValueError) as ctx:
+                    mcp.load_media([big])
+        finally:
+            os.environ.pop("TG_RICH_MEDIA_TOTAL_MB", None)
+        self.assertEqual(reads, [], "超预算的文件不该被读进内存")
+        self.assertIn("总预算", str(ctx.exception))
+
+    def test_growth_during_read_still_rejected(self):
+        """B3：stat 骗过闸、read 时文件长大——按实际字节再验单文件上限，仍拒。
+
+        反向变异：去掉读后的 `len(blob) > cap` 复验，本测试转红（32 字节被接收）。
+        """
+        from unittest.mock import patch as _p
+        photo = self.dir / "g.webp"
+        photo.write_bytes(b"x")
+        real_rb = Path.read_bytes
+
+        def growing(path):
+            if path == photo:
+                path.write_bytes(b"x" * 32)   # stat 时 1 字节，读之前长到 32
+            return real_rb(path)
+
+        with _p.object(mcp, "MEDIA_MAX_BYTES", 8), \
+                _p.object(Path, "read_bytes", growing):
+            with self.assertRaises(ValueError):
+                mcp.load_media([str(photo)])
+
 
 @needs_hook
 class ConcurrentStateWrites(unittest.TestCase):

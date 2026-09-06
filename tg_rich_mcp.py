@@ -219,25 +219,36 @@ def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
                 f"media_paths[{i}] 的文件名看着像凭证（{path.name}），不发。"
                 "确认无害的话设 TG_RICH_MEDIA_GUARD=0 再试"
             )
-        size = real.stat().st_size
-        if size > MEDIA_MAX_BYTES:
-            raise ValueError(
-                f"media_paths[{i}] 超过 Bot API 的 50MB 上限"
-                f"（{size / 1024 / 1024:.0f}MB）：{path.name}"
-            )
-        # 总量预算按**实际读到的字节**累计，不信 stat——stat 与 read 之间
-        # 文件可能又长了（TOCTOU），预算要拦的是内存，就按进了内存的算。
+        # 先按 stat 预检：已经超限的文件一个字节都不读进内存（内存主闸）。
+        # cap＝这个文件最多还能占的字节＝单文件上限与剩余累计预算取小。
+        stat_size = real.stat().st_size
+        cap = min(MEDIA_MAX_BYTES, budget - total)
+        if stat_size > cap:
+            raise _budget_error(i, path.name, stat_size, total, budget)
+        # stat 与 read 之间文件可能又长了（TOCTOU）：读完按**实际字节**再验两道闸，
+        # 别让 stat 骗过去。这类增长罕见、增量有限；真要严丝合缝可改临时文件流式，
+        # 「定长」不要求全部内容驻留内存。文档区分了输入字节预算/请求体/进程内存。
         blob = real.read_bytes()
+        if len(blob) > cap:
+            raise _budget_error(i, path.name, len(blob), total, budget)
         total += len(blob)
-        if total > budget:
-            raise ValueError(
-                f"media_paths 累计 {total / 1024 / 1024:.0f}MB，超过总预算 "
-                f"{budget // (1024 * 1024)}MB（每个文件都合法≠一起发合法——"
-                "全部读进内存拼 multipart 会吃光 RSS）。分几条消息发，"
-                "或按需调 TG_RICH_MEDIA_TOTAL_MB"
-            )
         files[f"f{i}"] = (path.name, blob)
     return files
+
+
+def _budget_error(i: int, name: str, size: int, used: int, budget: int) -> ValueError:
+    """超限报错：分清是单文件超 50MB，还是累计超总预算。"""
+    mb = size / 1024 / 1024
+    if size > MEDIA_MAX_BYTES:
+        return ValueError(
+            f"media_paths[{i}] 超过 Bot API 的 50MB 上限（{mb:.0f}MB）：{name}"
+        )
+    return ValueError(
+        f"media_paths 累计将超过总预算 {budget // (1024 * 1024)}MB"
+        f"（media_paths[{i}]={mb:.0f}MB，此前已用 {used / 1024 / 1024:.0f}MB；"
+        "每个文件都合法≠一起发合法——全部读进内存拼 multipart 会吃光 RSS）。"
+        "分几条消息发，或按需调 TG_RICH_MEDIA_TOTAL_MB"
+    )
 
 
 def extract_file_ids(result: Any) -> list[str]:
