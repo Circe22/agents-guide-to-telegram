@@ -1451,7 +1451,7 @@ class StopCleanupPersistence(unittest.TestCase):
     审查那支跑真实子进程 + 15s 宿主超时；这里用**同进程持锁 + 有界超时缩短**复现
     同一业务结果（不占 15s），并补一支「后续执行者真把它补做掉」的恢复用例。
 
-    反向变异：把 _finish_session 第一步里写 pending_cleanup 的那几行拿掉，
+    反向变异：把 _finish_session 第一步里追加清理任务的几行拿掉，
     test_stop_timeout_persists_cleanup_responsibility 转红（责任凭空消失）；
     把 _push_locked / _drain_pending_cleanup 的补做逻辑拿掉，
     test_persisted_cleanup_recovered_by_next_executor 转红（窗永远收不掉）。
@@ -1506,9 +1506,8 @@ class StopCleanupPersistence(unittest.TestCase):
         self.assertEqual(self.calls, [], "锁被占住时不该有清理请求发出去")
         state = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(int(state.get("msg_id") or 0), 0, "活动窗口该已清空")
-        task = state.get("pending_cleanup")
-        self.assertIsInstance(task, dict, "清理责任没落进 pending_cleanup")
-        self.assertEqual(int(task.get("msg_id") or 0), 42, "42 号窗的清理责任丢了")
+        self.assertEqual([t["msg_id"] for t in state.get("cleanup_queue", [])], [42],
+                         "42 号窗的清理责任没落进队列")
 
     def test_persisted_cleanup_recovered_by_next_executor(self):
         # 先制造一个「Stop 没做完、责任落盘」的 state
@@ -1523,16 +1522,113 @@ class StopCleanupPersistence(unittest.TestCase):
             _f.flock(push_lock, _f.LOCK_UN)
             push_lock.close()
         self.assertEqual(self.calls, [])
-        # 后续执行者：新一轮的 push 持同一把推送锁，应把 42 号窗补删、并清掉责任
-        path.write_text(json.dumps({**json.loads(path.read_text()),
-                                    "claim": 5, "seq": 5, "sched_seq": 5,
-                                    "last_push": 0.0}), encoding="utf-8")
-        hook._push(path, 5)
+        # 经过真正的 main 新轮重建，再执行它调度的 push；不能手改状态跳过 ROUND_GAP。
+        import io
+        event = {"session_id": "s6", "tool_name": "Bash", "tool_input": {"description": "work"}}
+        with mock.patch.object(sys, "argv", ["tg_progress_hook.py"]), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(event))), \
+                mock.patch.object(hook.subprocess, "Popen") as spawn:
+            hook.main()
+        spawn.assert_called_once()
+        state = json.loads(path.read_text())
+        self.assertEqual([t["msg_id"] for t in state["cleanup_queue"]], [42])
+        hook._push(path, state["seq"])
         deleted = [int(d.get("message_id") or 0)
                    for m, d in self.calls if m == "deleteMessage"]
         self.assertIn(42, deleted, "后续执行者没把遗留的窗收掉")
         state = json.loads(path.read_text(encoding="utf-8"))
-        self.assertFalse(state.get("pending_cleanup"), "补做后应清掉 pending_cleanup")
+        self.assertFalse(state.get("cleanup_queue"), "补做后应移除完成的任务")
+
+    @staticmethod
+    def _pending_ids(state):
+        ids = {t["msg_id"] for t in state.get("cleanup_queue", [])}
+        legacy = state.get("pending_cleanup")
+        if isinstance(legacy, dict):
+            ids.add(legacy["msg_id"])
+        return ids
+
+    def test_failed_cleanup_survives_next_round_stop(self):
+        old_task = {"msg_id": 42, "lines": ["old"], "total": 1, "end_mode": "delete"}
+        path = self._seed(msg_id=0, claim=5, seq=5, sched_seq=5, pending_cleanup=old_task)
+        deleted = []
+
+        def api(method, data, files=None):
+            if method == "deleteMessage":
+                if data["message_id"] == 42:
+                    raise RuntimeError("temporary network failure")
+                deleted.append(data["message_id"])
+            return {"ok": True, "result": {"message_id": 55}}
+
+        with mock.patch.object(mcp, "call_api", api):
+            hook._push(path, 5)
+            midway = json.loads(path.read_text())
+            self.assertEqual(midway["msg_id"], 55)
+            self.assertEqual(self._pending_ids(midway), {42})
+            hook._finish_session("s6")
+        state = json.loads(path.read_text())
+        self.assertEqual(deleted, [55])
+        self.assertEqual(self._pending_ids(state), {42}, "新一轮 Stop 覆盖了未完成的旧任务")
+        self.assertNotIn("pending_cleanup", state, "旧单槽状态应迁移为队列")
+
+    def test_temporary_cleanup_errors_remain_retryable(self):
+        for mode in ("delete", "keep"):
+            for code in (429, 500, 503):
+                with self.subTest(mode=mode, code=code):
+                    path = self._seed()
+                    with mock.patch.dict(os.environ, {"TG_PROGRESS_END": mode}), \
+                            mock.patch.object(mcp, "call_api", side_effect=mcp.ApiRejected(
+                                "temporary API failure", code)) as api:
+                        hook._finish_session("s6")
+                    api.assert_called_once()   # 限流时不立即再发一个降级请求
+                    self.assertEqual(self._pending_ids(json.loads(path.read_text())), {42})
+                    hook._finish_session("s6")   # 下一次成功后才移除
+                    self.assertEqual(self._pending_ids(json.loads(path.read_text())), set())
+
+    def test_delete_fallback_rate_limit_keeps_task(self):
+        path = self._seed()
+        errors = [mcp.ApiRejected("message can't be deleted", 400),
+                  mcp.ApiRejected("Too Many Requests: retry after 1", 429)]
+        with mock.patch.object(mcp, "call_api", side_effect=errors) as api:
+            hook._finish_session("s6")
+        self.assertEqual([c.args[0] for c in api.call_args_list], ["deleteMessage", "editMessageText"])
+        self.assertEqual(self._pending_ids(json.loads(path.read_text())), {42})
+
+    def test_permanently_missing_message_completes_task(self):
+        path = self._seed()
+        with mock.patch.object(mcp, "call_api", side_effect=mcp.ApiRejected(
+                "message to edit not found", 400)):
+            hook._finish_session("s6")
+        self.assertEqual(self._pending_ids(json.loads(path.read_text())), set())
+
+    def test_ack_preserves_stop_task_added_during_request(self):
+        old_task = {"msg_id": 42, "lines": ["old"], "total": 1, "end_mode": "delete"}
+        path = self._seed(msg_id=55, gen=1, pending_cleanup=old_task)
+        deleted = []
+
+        def api(method, data, files=None):
+            deleted.append(data["message_id"])
+            if data["message_id"] == 42:
+                # 清理 42 的请求在途时，Stop 为当前活动的 55 追加任务；推送锁仍被占用。
+                with mock.patch.object(hook, "_FINISH_PUSH_WAIT_SECONDS", 0):
+                    hook._finish_session("s6")
+            return {"ok": True, "result": {}}
+
+        with mock.patch.object(mcp, "call_api", api):
+            hook._drain_pending_cleanup(path, 0)
+            self.assertEqual(self._pending_ids(json.loads(path.read_text())), {55})
+            hook._drain_pending_cleanup(path, 0)
+        self.assertEqual(deleted, [42, 55])
+        self.assertEqual(self._pending_ids(json.loads(path.read_text())), set())
+
+    def test_draft_push_recovers_legacy_cleanup_task(self):
+        old_task = {"msg_id": 42, "lines": ["old"], "total": 1, "end_mode": "delete"}
+        path = self._seed(msg_id=0, pending_cleanup=old_task)
+        with mock.patch.dict(os.environ, {"TG_PROGRESS_MODE": "draft"}), \
+                mock.patch.object(mcp, "tool_draft") as draft:
+            hook._push(path, 1)
+        draft.assert_called_once()
+        self.assertEqual([d["message_id"] for m, d in self.calls if m == "deleteMessage"], [42])
+        self.assertEqual(self._pending_ids(json.loads(path.read_text())), set())
 
 
 if __name__ == "__main__":

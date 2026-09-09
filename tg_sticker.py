@@ -115,8 +115,8 @@ _LOCK_WAIT_SECONDS = 10.0      # 抢锁总超时——真抢不到就抛，别�
 class _CrossProcessLock:
     """给某个状态文件配一把固定 `<path>.lock` 的系统互斥锁（上下文管理器）。
 
-    不同文件用不同锁；嵌套只在「库锁内再拿缓存锁」这一种固定顺序发生，
-    无环故不死锁。抢锁失败会抛 TimeoutError——调用方（import 提交等）据此
+    不同文件用不同锁。导入按「同 unique 的 pending 锁 → 库锁」排序，库锁释放后
+    才取缓存锁；其它路径不反向取 pending 锁。抢锁失败会抛 TimeoutError——调用方据此
     把这次操作当失败报出去，好过静默丢数据。
 
     两端统一「非阻塞尝试 + 有界等待」：Unix `flock(LOCK_EX|LOCK_NB)`、Windows
@@ -624,29 +624,48 @@ def _download_original(file_id: str, api: Callable[..., dict[str, Any]],
 def tool_sticker_import(args: dict[str, Any], token: str,
                         api: Callable[..., dict[str, Any]],
                         download: Callable[[str], bytes]) -> str:
+    """下载在锁外；同一 unique 的发布、认领快照和清理共用一把 pending 锁。"""
     file_id = str(args.get("file_id") or "").strip()
     unique_arg = str(args.get("file_unique_id") or "").strip()
+    if file_id:
+        downloaded = _download_original(file_id, api, download)
+        unique = downloaded[0]
+    elif unique_arg:
+        downloaded = None
+        unique = unique_arg
+    else:
+        raise ValueError("要么给新贴纸的 file_id，要么给待认领区里的 file_unique_id")
+    # unique 是文件名的一部分；认领参数不能借创建锁文件写到 pending 目录之外。
+    if unique in (".", "..") or any(char in unique for char in ("/", "\\", ":", "\0")):
+        raise ValueError("file_unique_id 不能包含路径分隔符或驱动器前缀")
+    with _CrossProcessLock(_pending_dir() / f"{unique}.json"):
+        return _import_sticker_locked(args, token, unique, downloaded)
+
+
+def _import_sticker_locked(args: dict[str, Any], token: str, unique: str,
+                           downloaded: tuple[str, str, bytes] | None) -> str:
+    """持有该 unique 的 pending 锁；所有读取均在锁内重新取得快照。"""
+    file_id = str(args.get("file_id") or "").strip()
     title = str(args.get("title") or "").strip()
     emoji = _strip_vs(str(args.get("emoji") or "").strip())
     stickers = load_library()
 
     # ---- 认领待认领区（不用重新下载） ----
     pending_record: dict[str, Any] | None = None
-    if unique_arg and not file_id:
-        pending_path = _pending_dir() / f"{unique_arg}.json"
+    if downloaded is None:
+        pending_path = _pending_dir() / f"{unique}.json"
         pending_record = _read_json(pending_path, {}) or None
         if not pending_record:
-            existing = _find_by_unique(stickers, unique_arg)
+            existing = _find_by_unique(stickers, unique)
             if existing:
                 return (f"这张早就是馆藏 {existing.get('id')} 号"
                         f"「{existing.get('title')}」了，不用重复入库。")
             raise ValueError(
-                f"待认领区里没有 {unique_arg}。新贴纸请带 file_id 来（我去下载归档）。")
+                f"待认领区里没有 {unique}。新贴纸请带 file_id 来（我去下载归档）。")
 
     # blob＝本次导入**自己持有的**原图字节（内存里的）。提交归档时从它写，绝不在
-    # 锁内回头去读某个共享 pending 文件——那个文件另一个并发导入随时能截断（R1）。
+    # 库锁内回头读共享文件。认领快照也在 pending 锁内读取，发布/清理不能与它并发。
     if pending_record:
-        unique = unique_arg
         archive = Path(str(pending_record.get("file") or ""))
         file_id = str(pending_record.get("file_id") or "")
         if not archive.is_file():
@@ -654,19 +673,17 @@ def tool_sticker_import(args: dict[str, Any], token: str,
         ext = archive.suffix.lower()
         blob = archive.read_bytes()   # 认领路径：把原图一次性读进内存，之后只认 blob
     else:
-        if not file_id:
-            raise ValueError("要么给新贴纸的 file_id，要么给待认领区里的 file_unique_id")
-        unique, ext, blob = _download_original(file_id, api, download)
+        unique, ext, blob = downloaded
         existing = _find_by_unique(stickers, unique)
         if existing:
             remember_file_id(token, unique, file_id)
             return (f"认识：馆藏 {existing.get('id')} 号「{existing.get('title')}」"
                     f"{existing.get('emoji')}（file_id 已更新进本 bot 缓存）。")
         # 下载落地一份 pending 面包屑（崩在提交前也不丢下载/可被后续认领）；
-        # 但它**不**再作为归档的来源，归档只认上面的内存 blob。
+        # 直接入库用本次 blob；之后的认领会读这份文件，因此 pending 也必须原子发布。
         _pending_dir().mkdir(parents=True, exist_ok=True)
         archive = _pending_dir() / f"{unique}{ext}"
-        archive.write_bytes(blob)
+        _atomic_write_bytes(archive, blob)
 
     # ---- 元数据不全 ⇒ 落待认领区，等 agent 看图再来 ----
     if not (title and emoji):
@@ -719,7 +736,8 @@ def tool_sticker_import(args: dict[str, Any], token: str,
             stickers.append(entry)
             save_library(stickers)
 
-    # 锁外收尾：缓存 file_id（缓存有自己的锁，别嵌在库锁里）、清待认领区
+    # 库锁外收尾；pending 锁仍持有，不能删掉另一调用刚发布的待认领记录。
+    # 缓存有自己的锁，不嵌在库锁里。
     if file_id:
         remember_file_id(token, unique, file_id)
     pending_json = _pending_dir() / f"{unique}.json"

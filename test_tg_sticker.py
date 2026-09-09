@@ -286,8 +286,8 @@ class TestImport(Base):
         lib = tg_sticker.load_library()
         self.assertEqual(lib[0]["title"], "试验猫")
         self.assertEqual(lib[0]["file_unique_id"], "NEWUNIQ")
-        self.assertFalse(list((self.dir / "pending").glob("NEWUNIQ*")),
-                         "认领后待认领区要清干净")
+        self.assertEqual({p.name for p in (self.dir / "pending").glob("NEWUNIQ*")},
+                         {"NEWUNIQ.json.lock"}, "认领后只保留固定系统锁文件")
         # file_id 进了本 bot 缓存
         self.assertEqual(tg_sticker.load_cache(TOKEN)["NEWUNIQ"], "FID_LONG_ENOUGH_ABC")
 
@@ -297,6 +297,15 @@ class TestImport(Base):
             TOKEN, FakeApi(), lambda p: b"bytes")
         self.assertIn("入库", out)
         self.assertEqual(tg_sticker.load_library()[0]["emoji"], "😼")
+
+    def test_unique_id_cannot_create_lock_outside_pending(self):
+        api = FakeApi()
+        for unique in ("../outside", "..\\outside", "C:outside", "bad\0id"):
+            with self.subTest(unique=unique), self.assertRaises(ValueError):
+                tg_sticker.tool_sticker_import({"file_unique_id": unique}, TOKEN, api,
+                                               lambda p: b"")
+        self.assertEqual(api.calls, [])
+        self.assertFalse((self.dir / "pending").exists())
 
     def test_reimport_recognized(self):
         tg_sticker.tool_sticker_import(
@@ -573,67 +582,66 @@ class TestHookScan(Base):
 
 # ---------- R1：并发导入同一 unique，归档不许拷进被截断的 pending ----------
 class TestSameStickerTruncation(Base):
-    """R1（收编审查反例）：两个调用同时导入同一张贴纸时，B 把共享 pending 文件
-    `open('wb')` 截断为零字节的窗口内，A 正好提交归档——归档必须仍是完整原图，
-    不能拷到 B 截断出来的空文件。
+    """同 unique 的下载发布与直接入库/待认领均互斥；两次成功且归档字节完整。
 
-    业务结果：两个调用都成功、库里一条记录、且**归档字节 == 下载到的原图**。
-    反向变异：把 `tool_sticker_import` 提交段的 `_atomic_write_bytes(final, blob)`
-    换回 `final.write_bytes(archive.read_bytes())`（回头读共享 pending），此测试
-    必转红（归档变成 b''）。
+    旧测试要求 B 在 A 持锁时写共享 pending；新事务锁正确阻止这一前提。
+    现在暂停 A 的发布过程，确认 B 真正遇到锁竞争，再释放 A 验证完整业务结果。
     """
 
-    def test_archive_not_copied_from_truncated_pending(self):
+    def _race_publication(self, claim):
         tg_sticker.save_library([])
-        a_has_lock, b_truncated, a_done = (threading.Event() for _ in range(3))
-        original_enter = tg_sticker._CrossProcessLock.__enter__
-        original_write = Path.write_bytes
+        publishing, release, contended = (threading.Event() for _ in range(3))
+        original_publish = tg_sticker._atomic_write_bytes
+        original_lock = tg_sticker._CrossProcessLock._try_lock
         results, errors = [], []
 
-        def enter(lock):
-            value = original_enter(lock)
-            if (threading.current_thread().name == "A"
-                    and lock.lock_path.name == "library.json.lock"):
-                a_has_lock.set()
-                if not b_truncated.wait(3):
-                    raise RuntimeError("B never opened pending file")
-            return value
+        def publish(path, content, *args, **kwargs):
+            if threading.current_thread().name == "A" and path.parent.name == "pending":
+                publishing.set()
+                if not release.wait(5):
+                    raise RuntimeError("Publication barrier timed out")
+            return original_publish(path, content, *args, **kwargs)
 
-        def write(path, content):
-            if (threading.current_thread().name == "B"
-                    and path.name == "SAME.webp" and path.parent.name == "pending"):
-                with path.open("wb") as out:   # 正常 write_bytes 就是先在这里截断
-                    b_truncated.set()
-                    if not a_done.wait(3):
-                        raise RuntimeError("A never completed")
-                    return out.write(content)
-            return original_write(path, content)
+        def try_lock(fd):
+            acquired = original_lock(fd)
+            if threading.current_thread().name == "B" and not acquired:
+                contended.set()
+            return acquired
 
         def api(method, data, files=None):
             return {"ok": True, "result": {
                 "file_unique_id": "SAME", "file_path": "same.webp", "file_size": 18}}
 
-        def worker(label):
+        if claim:
+            tg_sticker.tool_sticker_import({"file_id": "initial"}, TOKEN, api,
+                                            lambda remote: b"VALID_STICKER_BYTES")
+
+        def worker(label, args):
             try:
                 results.append(tg_sticker.tool_sticker_import(
-                    {"file_id": label, "title": label, "emoji": "😺"},
-                    TOKEN, api, lambda remote: b"VALID_STICKER_BYTES"))
+                    args, TOKEN, api, lambda remote: b"VALID_STICKER_BYTES"))
             except Exception as exc:  # noqa: BLE001
                 errors.append(repr(exc))
-            finally:
-                if label == "A":
-                    a_done.set()
 
-        with mock.patch.object(tg_sticker._CrossProcessLock, "__enter__", enter), \
-                mock.patch.object(Path, "write_bytes", write):
-            a = threading.Thread(target=worker, args=("A",), name="A")
-            b = threading.Thread(target=worker, args=("B",), name="B")
+        a_args = {"file_id": "A"} if claim else {"file_id": "A", "title": "A", "emoji": "😺"}
+        b_args = {"file_unique_id": "SAME"} if claim else {"file_id": "B"}
+        b_args.update(title="B", emoji="😺")
+        with mock.patch.object(tg_sticker, "_atomic_write_bytes", publish), \
+                mock.patch.object(tg_sticker._CrossProcessLock, "_try_lock", side_effect=try_lock):
+            a = threading.Thread(target=worker, args=("A", a_args), name="A")
+            b = threading.Thread(target=worker, args=("B", b_args), name="B")
             a.start()
-            self.assertTrue(a_has_lock.wait(2))
-            b.start()
-            a.join(5)
-            b.join(5)
+            try:
+                self.assertTrue(publishing.wait(3))
+                b.start()
+                self.assertTrue(contended.wait(3), "同 unique 的认领/导入没有等待 pending 事务")
+            finally:
+                release.set()
+                a.join(6)
+                if b.ident is not None:
+                    b.join(6)
 
+        self.assertFalse(a.is_alive() or b.is_alive())
         self.assertEqual(errors, [], errors)
         self.assertEqual(len(results), 2)
         lib = tg_sticker.load_library()
@@ -641,6 +649,31 @@ class TestSameStickerTruncation(Base):
         archived = (tg_sticker.sticker_dir() / lib[0]["file"]).read_bytes()
         self.assertEqual(archived, b"VALID_STICKER_BYTES",
                          f"归档在 pending 被截断时拷了空内容：{archived!r}")
+        self.assertFalse((self.dir / "pending" / "SAME.json").exists())
+        self.assertFalse((self.dir / "pending" / "SAME.webp").exists())
+
+    def test_direct_import_waits_for_same_unique_publication(self):
+        self._race_publication(claim=False)
+
+    def test_pending_claim_waits_for_same_unique_publication(self):
+        self._race_publication(claim=True)
+
+    def test_partial_pending_write_is_not_published(self):
+        api = FakeApi()
+        pending = self.dir / "pending" / "NEWUNIQ.webp"
+        tg_sticker.tool_sticker_import({"file_id": "initial"}, TOKEN, api,
+                                       lambda remote: b"old-complete")
+        original_write = Path.write_bytes
+
+        def partial_write(path, data):
+            original_write(path, data[:3])
+            self.assertEqual(pending.read_bytes(), b"old-complete")
+            return original_write(path, data)
+
+        with mock.patch.object(Path, "write_bytes", partial_write):
+            tg_sticker.tool_sticker_import({"file_id": "again"}, TOKEN, api,
+                                           lambda remote: b"new-complete")
+        self.assertEqual(pending.read_bytes(), b"new-complete")
 
 
 # ---------- R3：系统锁的活性/互斥（同进程 fcntl 版，非 fcntl 平台跳过） ----------

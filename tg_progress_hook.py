@@ -79,7 +79,7 @@ ROUND_GAP = 150.0       # 秒，离上一帧这么久没动静就当新一轮，
 CLAIM_TTL = 60.0        # 秒，开窗这活派出去多久还没拿到 message_id 就允许改派
 # Stop 收尾抢推送锁的**有界**上限（R5）。它比宿主给 Stop 的超时（README 15s）大，
 # 正常情况下在飞的编辑早就返回、这里立刻拿到锁把窗收掉；真被长请求卡住时，宿主会
-# 先杀掉 Stop——而清理责任已在第一步落进 state 的 pending_cleanup，后续执行者（下一
+# 先杀掉 Stop——而清理责任已在第一步落进 state 的 cleanup_queue，后续执行者（下一
 # 轮 push、或下一次 Stop）持同一把推送锁时补做，绝不会因为这次没抢到就永远丢掉。
 # 这个界只是防「宿主没配超时」时无限期挂住，不是保证清理在本次做完。
 _FINISH_PUSH_WAIT_SECONDS = 45.0
@@ -362,34 +362,61 @@ def _rich(blocks: list[dict]) -> str:
 # Stop 收窗时若同步等推送锁没等到（在飞的慢请求握着它、宿主又把 Stop 超时杀了），
 # 光靠「同步删窗」会连责任一起丢：state 里 msg_id 已清零、又没别的地方记着「42 号窗
 # 还没收」，那扇窗就永远留在聊天里、再也没人来删。做法是**清空活动窗口前先把清理
-# 任务落进 state（pending_cleanup）**，由后续持同一把推送锁的执行者补做；同步那步只
+# 任务落进 state（cleanup_queue）**，由后续持同一把推送锁的执行者补做；同步那步只
 # 是 best-effort、有界等待。
-def _read_pending_cleanup(state_path: Path) -> dict | None:
+def _cleanup_key(task: dict) -> tuple[int, int]:
+    return int(task.get("gen") or 0), int(task.get("msg_id") or 0)
+
+
+def _cleanup_tasks(state: dict) -> list[dict]:
+    """读取队列并兼容旧版单槽 pending_cleanup；不修改传入的状态。"""
+    queue = state.get("cleanup_queue")
+    candidates = list(queue) if isinstance(queue, list) else []
+    legacy = state.get("pending_cleanup")
+    if isinstance(legacy, dict):
+        candidates.append(legacy)
+    tasks: list[dict] = []
+    seen = set()
+    for task in candidates:
+        if not isinstance(task, dict):
+            continue
+        key = _cleanup_key(task)
+        if key[1] and key not in seen:
+            tasks.append(dict(task))
+            seen.add(key)
+    return tasks
+
+
+def _read_cleanup_queue(state_path: Path) -> list[dict]:
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
-        return None
-    task = state.get("pending_cleanup") if isinstance(state, dict) else None
-    return task if isinstance(task, dict) and int(task.get("msg_id") or 0) else None
+        return []
+    return _cleanup_tasks(state) if isinstance(state, dict) else []
 
 
-def _clear_pending_cleanup(state_path: Path) -> None:
-    _amend(state_path, {"pending_cleanup": None})
+def _ack_cleanup_task(state_path: Path, task: dict) -> None:
+    """完成一条任务后锁内重读，只删其身份；保留在途请求期间新 Stop 追加的任务。"""
+    with open(str(state_path) + ".lock", "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        key = _cleanup_key(task)
+        state["cleanup_queue"] = [t for t in _cleanup_tasks(state) if _cleanup_key(t) != key]
+        state.pop("pending_cleanup", None)
+        _atomic_write(state_path, state)
 
 
 def _run_cleanup_task(state_path: Path, task: dict) -> None:
     """执行一条持久化清理任务——**必须在持有推送锁时调用**（与普通推送同一把锁、
     同一套顺序，绝不和在飞的编辑抢同一扇窗）。
 
-    做成（或服务器明确拒收＝目标已达成/无从达成）就把 pending_cleanup 清掉；
-    只有**网络错/超时**才留着，让下一个执行者重试——绝不因一次网络抖动就把责任丢了，
-    也绝不死循环重发一个服务器已经拒的请求。
+    成功或明确的消息永久不可编辑才确认完成。网络错、429、5xx 以及不能判定为
+    永久失效的拒绝均保留任务；每个执行者只尝试队列快照一次，不在这里循环重试。
     """
     from tg_rich_mcp import _default_chat, call_api  # noqa: PLC0415
 
     message_id = int(task.get("msg_id") or 0)
     if not message_id:
-        _clear_pending_cleanup(state_path)
         return
     chat = _default_chat()
     if not chat:
@@ -404,24 +431,23 @@ def _run_cleanup_task(state_path: Path, task: dict) -> None:
                 call_api("deleteMessage", {"chat_id": chat, "message_id": message_id})
                 done = True
             except Exception as exc:          # noqa: BLE001
-                if getattr(exc, "code", None) is None:
-                    return                    # 网络错（无 error_code）：留着重试
-                # 服务器拒收（如超 48h 删不掉，带 error_code）：退回定格
+                if getattr(exc, "code", None) != 400:
+                    return                    # 网络错 / 限流 / 5xx 等：留着重试
+                # 删除被 400 拒绝（如超过可删除期限）：尝试定格；不能直接确认清理完成。
         if not done:
             call_api("editMessageText", {
                 "chat_id": chat, "message_id": message_id,
                 "rich_message": _rich(_blocks(lines, total, done=True)),
             })
     except Exception as exc:                   # noqa: BLE001
-        if getattr(exc, "code", None) is None:
-            return                             # 网络错：留着重试
-        # 服务器明确拒收（消息没了/不能编辑）：目标达成或无从达成，别死循环，往下清掉
-    _clear_pending_cleanup(state_path)
+        if not _looks_message_gone(exc):
+            return                             # 429/5xx/网络错/未知拒绝都保留
+    _ack_cleanup_task(state_path, task)
 
 
 def _drain_pending_cleanup(state_path: Path, wait_seconds: float) -> None:
-    """有界地抢推送锁、把 pending_cleanup 补做掉；抢不到就留着给后续执行者。"""
-    if not _read_pending_cleanup(state_path):
+    """有界地抢推送锁、尝试清理队列；抢不到就留着给后续执行者。"""
+    if not _read_cleanup_queue(state_path):
         return                                 # 没有待清任务：连锁都不碰
     lock_path = Path(str(state_path) + ".push.lock")
     try:
@@ -437,8 +463,7 @@ def _drain_pending_cleanup(state_path: Path, wait_seconds: float) -> None:
                 if time.monotonic() >= deadline:
                     return                     # 有界超时：责任留在 state，后续执行者补做
                 time.sleep(_PUSH_SPIN_SECONDS)
-            task = _read_pending_cleanup(state_path)   # 锁内重读，别和别的执行者重复做
-            if task:
+            for task in _read_cleanup_queue(state_path):   # 锁内重读，各任务最多尝试一次
                 _run_cleanup_task(state_path, task)
     except Exception:
         pass                                   # 铁律①：收尾清理再失败也不许炸 Stop
@@ -476,6 +501,11 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
         total = int(state.get("total") or 0)
         gen = int(state.get("gen") or 0)   # 这一帧属于哪一代，登记时要对得上
 
+        # 推送锁已持有；edit/draft 都先补做遗留任务。失败的任务留在磁盘队列，
+        # 本轮继续工作，下一次 Stop 只能追加，不能覆盖它们。
+        for task in _cleanup_tasks(state):
+            _run_cleanup_task(state_path, task)
+
         if _mode() == "draft":
             # 锁内重读之后再判：被更新的**已调度**帧顶替了才让位（那帧的子进程真在飞）。
             # 只被节流推高 seq、没派子进程的，不能让唯一在飞的投递任务让位（B6）。
@@ -494,13 +524,6 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
         chat = _default_chat()
         if not chat:
             return 0
-
-        # Stop 没做完的持久化清理（宿主超时/进程被杀留下的，R5）：这里正持着推送锁，
-        # 与在飞的编辑同一套顺序，顺手把它补做掉。放在开新窗之前，免得旧窗和新窗并存。
-        task = state.get("pending_cleanup")
-        if isinstance(task, dict) and int(task.get("msg_id") or 0):
-            _run_cleanup_task(state_path, task)
-            state["pending_cleanup"] = None   # 本地副本同步清，避免本轮后续再看到
 
         # 上一轮的孤儿窗（Stop hook 没跑到、ROUND_GAP 顶替收的场）：开新窗前先收掉
         stale = int(state.get("stale_msg") or 0)
@@ -570,7 +593,7 @@ def _finish_session(session: str) -> int:
     """收工——默认把窗口撤掉，`keep` 时定格成终态。之后下一轮另开一扇。
 
     先关账、后善后：**第一步在 state 锁里一笔完成「gen+1 + 摘走 msg_id + 清空
-    + 把该 msg_id 的清理责任落进 pending_cleanup」**，从这一刻起本轮就算死了——
+    + 把该 msg_id 的清理责任追加到 cleanup_queue」**，从这一刻起本轮就算死了——
     还在飞的推送子进程回来后 CAS(gen) 必然失败，会自己把刚发出去的消息删掉
     （见 _push_locked），不会再有孤儿窗复活。
 
@@ -582,7 +605,7 @@ def _finish_session(session: str) -> int:
     拖慢；这里拖住的只是 Stop 自己的收尾，且有界、有兜底。）
     """
     state_path = _state_path(session)
-    # —— 第一步：锁内关账（bump gen + 摘走 msg_id + 清空 + 落 pending_cleanup）——
+    # —— 第一步：锁内关账（bump gen + 摘走 msg_id + 清空 + 追加清理任务）——
     try:
         with open(str(state_path) + ".lock", "w", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
@@ -607,17 +630,22 @@ def _finish_session(session: str) -> int:
             }
             # **清空活动窗口之前**把清理责任落盘（R5）：只认 msg_id 不认当前模式——
             # 用户 edit 跑了半截、重启改成 draft 时，账上挂着的持久窗照样要收掉。
+            queue = _cleanup_tasks(state)
             if message_id:
-                patch["pending_cleanup"] = {
+                task = {
                     "msg_id": message_id, "lines": lines, "total": total,
-                    "end_mode": _end_mode(),
+                    "end_mode": _end_mode(), "gen": int(state.get("gen") or 0),
                 }
+                if _cleanup_key(task) not in {_cleanup_key(t) for t in queue}:
+                    queue.append(task)
+            patch["cleanup_queue"] = queue
+            state.pop("pending_cleanup", None)
             state.update(patch)
             _atomic_write(state_path, state)
     except Exception:
         return 0
 
-    # —— 第二步：best-effort 即时清理，有界等推送锁；抢不到/被杀都有 pending_cleanup 兜底。
+    # —— 第二步：best-effort 即时清理，有界等推送锁；抢不到/被杀都有队列兜底。
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     _drain_pending_cleanup(state_path, _FINISH_PUSH_WAIT_SECONDS)
     return 0
@@ -682,7 +710,8 @@ def main() -> int:
                              if _end_mode() == "delete" else 0)
                 state = {"seq": int(state.get("seq") or 0),
                          "gen": int(state.get("gen") or 0) + 1,
-                         "stale_msg": stale_msg}
+                         "stale_msg": stale_msg,
+                         "cleanup_queue": _cleanup_tasks(state)}
 
             state.setdefault("draft_id", _draft_id(session))
             if not isinstance(state.get("lines"), list):
