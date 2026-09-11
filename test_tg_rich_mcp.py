@@ -23,6 +23,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -1629,6 +1630,170 @@ class StopCleanupPersistence(unittest.TestCase):
         draft.assert_called_once()
         self.assertEqual([d["message_id"] for m, d in self.calls if m == "deleteMessage"], [42])
         self.assertEqual(self._pending_ids(json.loads(path.read_text())), set())
+
+
+class BlocksGuard(unittest.TestCase):
+    """有界结构闸：一个函数一个咽喉，只 bounding、不复刻 schema。
+
+    坏了＝把无界的解析面/资源占用原样递给 API 和客户端。
+    这里全走 guard_blocks 直调（单元级）；端到端「零网络」与 JSON-string==list
+    的断言在 AdversarialBlocks 里（工具层）。
+    """
+
+    # ---- 正例：不该误伤的东西 ----
+    def test_unknown_block_type_passes_through(self):
+        """未知块型照样透传——目标是 bounding，不建自家 Telegram schema。"""
+        mcp.guard_blocks([{"type": "totally_made_up_block_9000", "whatever": 123,
+                           "nested": [{"x": "y"}]}])
+
+    def test_ordinary_blocks_pass(self):
+        mcp.guard_blocks([
+            {"type": "paragraph", "text": ["hi ", {"type": "bold", "text": "there"}]},
+            {"type": "table", "cells": [[{"text": "a"}, {"text": "b"}]]},
+            {"type": "list", "items": [
+                {"has_checkbox": True, "is_checked": False,
+                 "blocks": [{"type": "paragraph", "text": "todo"}]}]},
+        ])
+
+    def test_valid_map_passes(self):
+        mcp.guard_blocks([{"type": "map",
+                           "location": {"latitude": 63.4, "longitude": -19.05},
+                           "zoom": 12}])
+
+    def test_valid_attach_index_passes(self):
+        mcp.guard_blocks(
+            [{"type": "photo", "photo": {"type": "photo", "media": "attach://f1"}}],
+            media_count=2,
+        )
+
+    def test_http_url_passes(self):
+        mcp.guard_blocks(
+            [{"type": "photo", "photo": {"media": "https://example.com/a.jpg"}}])
+
+    # ---- 反例：深度（变异：拆掉 depth 检查这条转绿→红） ----
+    def test_depth_over_limit_rejected(self):
+        node: Any = {"type": "paragraph", "text": "deep"}
+        for _ in range(150):                      # 150 层，远超 16，且节点数≈150 不触发节点闸
+            node = {"type": "details", "blocks": [node]}
+        with self.assertRaisesRegex(ValueError, "深度"):
+            mcp.guard_blocks([node])
+
+    # ---- 反例：节点总数（变异：拆掉节点计数→红） ----
+    def test_too_many_nodes_rejected(self):
+        # 3000 个浅层小节点：深度只有 2，唯一能拦它的是节点闸
+        blocks = [{"type": "paragraph"} for _ in range(3000)]
+        with self.assertRaisesRegex(ValueError, "节点数"):
+            mcp.guard_blocks(blocks)
+
+    # ---- 反例：单数组过长（变异：拆掉数组长度检查→红） ----
+    def test_array_too_long_rejected(self):
+        # 抬高节点闸把数组闸单独隔出来：证明拦的真是「数组长度」不是「节点数」
+        os.environ["TG_RICH_BLOCKS_MAX_NODES"] = "100000"
+        try:
+            blocks = [{"type": "list", "items": [{} for _ in range(5000)]}]
+            with self.assertRaisesRegex(ValueError, "数组长度"):
+                mcp.guard_blocks(blocks)
+        finally:
+            os.environ.pop("TG_RICH_BLOCKS_MAX_NODES", None)
+
+    # ---- 反例：单字符串过长（变异：拆掉单串长度检查→红） ----
+    def test_single_string_too_long_rejected(self):
+        # 20 万字符：超单串上限，但总量在 100 万以内——只有单串闸能拦
+        blocks = [{"type": "paragraph", "text": "x" * 200_000}]
+        with self.assertRaisesRegex(ValueError, "字符串长度"):
+            mcp.guard_blocks(blocks)
+
+    # ---- 反例：字符总量（变异：拆掉总字符检查→红） ----
+    def test_total_chars_over_limit_rejected(self):
+        # 20 段各 6 万字符：每段都 < 单串上限 10 万，合计 120 万 > 100 万
+        blocks = [{"type": "paragraph", "text": "y" * 60_000} for _ in range(20)]
+        with self.assertRaisesRegex(ValueError, "字符总量"):
+            mcp.guard_blocks(blocks)
+
+    # ---- 反例：非 JSON 类型（变异：拆掉 else 兜底 raise→红） ----
+    def test_non_json_type_rejected(self):
+        with self.assertRaisesRegex(ValueError, "JSON"):
+            mcp.guard_blocks([{"type": "paragraph", "text": {1, 2, 3}}])  # set 不是 JSON 类型
+
+    # ---- 反例：dict 键非字符串（变异：拆掉键检查→红） ----
+    def test_non_string_dict_key_rejected(self):
+        with self.assertRaisesRegex(ValueError, "键必须是字符串"):
+            mcp.guard_blocks([{1: "x"}])
+
+    # ---- 反例：map 经纬度/缩放越界（变异：拆掉 _guard_map 调用→红） ----
+    def test_map_latitude_out_of_range_rejected(self):
+        with self.assertRaisesRegex(ValueError, "latitude"):
+            mcp.guard_blocks([{"type": "map",
+                               "location": {"latitude": 999, "longitude": 0}}])
+
+    def test_map_longitude_out_of_range_rejected(self):
+        with self.assertRaisesRegex(ValueError, "longitude"):
+            mcp.guard_blocks([{"type": "map",
+                               "location": {"latitude": 0, "longitude": 999}}])
+
+    def test_map_zoom_out_of_range_rejected(self):
+        with self.assertRaisesRegex(ValueError, "zoom"):
+            mcp.guard_blocks([{"type": "map",
+                               "location": {"latitude": 0, "longitude": 0},
+                               "zoom": 99}])
+
+    # ---- 反例：attach 索引越界（变异：拆掉 attach 检查→红） ----
+    def test_attach_index_out_of_range_rejected(self):
+        with self.assertRaisesRegex(ValueError, "attach"):
+            mcp.guard_blocks(
+                [{"type": "photo", "photo": {"media": "attach://f5"}}],
+                media_count=2,
+            )
+
+    def test_attach_without_media_rejected(self):
+        with self.assertRaisesRegex(ValueError, "attach"):
+            mcp.guard_blocks(
+                [{"type": "photo", "photo": {"media": "attach://f0"}}])
+
+    # ---- 反例：本地 scheme URL（变异：拆掉 file:// 检查→红） ----
+    def test_file_scheme_url_rejected(self):
+        with self.assertRaisesRegex(ValueError, "本地 scheme"):
+            mcp.guard_blocks(
+                [{"type": "photo", "photo": {"media": "file:///etc/passwd"}}])
+
+    def test_file_scheme_case_and_space_insensitive(self):
+        for bad in ["FILE:///etc/passwd", "  file://x  ", "File:/y"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    mcp.guard_blocks([{"media": bad}])
+
+    # ---- 报错不整段回显 payload ----
+    def test_error_does_not_echo_payload(self):
+        secret_marker = "SUPER_SECRET_PAYLOAD_MARKER_abc123"
+        blocks = [{"type": "paragraph", "text": secret_marker * 5000}]  # 触发单串上限
+        with self.assertRaises(ValueError) as ctx:
+            mcp.guard_blocks(blocks)
+        self.assertNotIn(secret_marker, str(ctx.exception))
+
+    def test_env_override_can_tighten_nodes(self):
+        """env 覆盖生效（同时兼当节点闸的独立佐证）。"""
+        os.environ["TG_RICH_BLOCKS_MAX_NODES"] = "5"
+        try:
+            with self.assertRaisesRegex(ValueError, "节点数"):
+                mcp.guard_blocks([{"type": "paragraph"} for _ in range(10)])
+        finally:
+            os.environ.pop("TG_RICH_BLOCKS_MAX_NODES", None)
+
+    def test_bad_env_falls_back_to_default(self):
+        os.environ["TG_RICH_BLOCKS_MAX_NODES"] = "胡写的"
+        try:
+            # 坏值回落 2000：10 个节点照常放行
+            mcp.guard_blocks([{"type": "paragraph"} for _ in range(10)])
+        finally:
+            os.environ.pop("TG_RICH_BLOCKS_MAX_NODES", None)
+
+    # ---- 闸挂在 build_rich 这一个咽喉上 ----
+    def test_guard_runs_via_build_rich(self):
+        node: Any = {"type": "paragraph", "text": "deep"}
+        for _ in range(150):
+            node = {"type": "details", "blocks": [node]}
+        with self.assertRaises(ValueError):
+            mcp.build_rich({"blocks": [node]})
 
 
 if __name__ == "__main__":

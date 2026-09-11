@@ -308,8 +308,160 @@ def extract_file_ids(result: Any) -> list[str]:
 _LAST_SENT: dict[str, int] = {}
 
 
+# ---------- blocks 有界结构闸（bounded structural guard）----------
+# 目标是 **bounding，不是复刻 Telegram 的 schema**：未知块型照样透传，
+# 只拦两类东西——① 资源无界（深度/节点/数组/字符串/总字符，攒着能撑爆内存或
+# 把解析面拖垮）；② 本地零成本就能判死的安全越界（map 经纬度出界、attach 索引
+# 越界、file:// 一类本地 scheme）。数字是**占位起点、不是圣旨**，集中成常量便于
+# 调；少数资源上限可 env 覆盖（坏值/非正数回落默认，绝不让脏配置放大或锁死闸）。
+BLOCKS_MAX_DEPTH = 16                        # 嵌套深度上限（details/list/collage 会真嵌套）
+BLOCKS_MAX_NODES_DEFAULT = 2000             # 总节点数（每个 dict/list/标量各算一个）
+BLOCKS_MAX_ARRAY_LEN = 4096                 # 单个数组的元素上限
+BLOCKS_MAX_STRING_LEN = 100_000            # 单个字符串的字符上限
+BLOCKS_MAX_TOTAL_CHARS_DEFAULT = 1_000_000  # 所有字符串字符数之和（总 payload 粗尺）
+
+# map 块的物理边界（Telegram schema：zoom 0-24）。经纬度写错＝把人定位到没意义的点，
+# 这类本地就能判，提前拦、报错更清楚——不是替 Telegram 复刻校验。
+_LAT_RANGE = (-90.0, 90.0)
+_LON_RANGE = (-180.0, 180.0)
+_ZOOM_RANGE = (0, 24)
+
+# 只拦「本地 scheme」这一类——**不建允许 scheme 的白名单**（那份清单会跟着
+# Telegram 漂移，违背 bounding 精神）。这里是很短的**黑**名单：本地读取类。
+_LOCAL_URL_SCHEMES = ("file",)
+
+_ATTACH_RE = re.compile(r"^attach://f(\d+)$")
+
+
+def _blocks_int_env(env_key: str, default: int) -> int:
+    """资源上限的 env 覆盖：空值/坏值/非正数一律回落默认。"""
+    raw = (os.environ.get(env_key) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _guard_map(node: dict[str, Any]) -> None:
+    """map 块：经纬度/缩放的物理边界。只在字段真是数值时判，结构不对留给 Telegram。"""
+    def _num(v: Any) -> bool:
+        # bool 是 int 子类，别把 True 当 1 放进来
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    location = node.get("location")
+    if isinstance(location, dict):
+        lat = location.get("latitude")
+        lon = location.get("longitude")
+        if _num(lat) and not (_LAT_RANGE[0] <= lat <= _LAT_RANGE[1]):
+            raise ValueError(
+                f"map.location.latitude 要在 [{_LAT_RANGE[0]},{_LAT_RANGE[1]}] 内"
+            )
+        if _num(lon) and not (_LON_RANGE[0] <= lon <= _LON_RANGE[1]):
+            raise ValueError(
+                f"map.location.longitude 要在 [{_LON_RANGE[0]},{_LON_RANGE[1]}] 内"
+            )
+    zoom = node.get("zoom")
+    if _num(zoom) and not (_ZOOM_RANGE[0] <= zoom <= _ZOOM_RANGE[1]):
+        raise ValueError(f"map.zoom 要在 [{_ZOOM_RANGE[0]},{_ZOOM_RANGE[1]}] 内")
+
+
+def _guard_string(value: str, media_count: int) -> None:
+    """字符串值的安全闸：attach:// 索引越界、file:// 一类本地 scheme。"""
+    match = _ATTACH_RE.match(value)
+    if match:
+        idx = int(match.group(1))
+        if idx >= media_count:
+            if media_count:
+                raise ValueError(
+                    f"attach://f{idx} 引用了不存在的媒体——"
+                    f"media_paths 只有 {media_count} 个文件（f0..f{media_count - 1}）"
+                )
+            raise ValueError(
+                f"attach://f{idx} 引用了媒体，但这次没有提供 media_paths"
+            )
+        return
+    stripped = value.strip().lower()
+    for scheme in _LOCAL_URL_SCHEMES:
+        if stripped.startswith(scheme + ":"):
+            raise ValueError(f"URL 用了本地 scheme（{scheme}:），不发")
+
+
+def guard_blocks(blocks: Any, media_count: int = 0) -> None:
+    """有界结构闸：**一个函数、一个咽喉**。凡接受内容结构的出站入口都过它。
+
+    只做两件事：① 把资源框住（深度/节点/数组/字符串/总字符）——显式栈**迭代**、
+    绝不递归（递归自身就是可被深嵌套打爆的攻击面）；② 本地就能判死的安全越界。
+    dict 的键必须是 str，只允许 JSON 兼容类型（dict/list/str/int/float/bool/None）。
+    **未知块型照样透传**：这里不复刻 Telegram 的 schema，只做 bounding。
+
+    拒绝一律发生在**任何网络请求之前**（build_rich 在 call_api 之前调本函数）；
+    报错**不整段回显 payload**——只报命中了哪条上限，够定位、不外泄内容。
+    """
+    max_nodes = _blocks_int_env("TG_RICH_BLOCKS_MAX_NODES", BLOCKS_MAX_NODES_DEFAULT)
+    max_total_chars = _blocks_int_env(
+        "TG_RICH_BLOCKS_MAX_CHARS", BLOCKS_MAX_TOTAL_CHARS_DEFAULT
+    )
+
+    nodes = 0
+    total_chars = 0
+    # 显式栈：(节点, 深度)。顶层 blocks 数组算深度 0，其元素从深度 1 起。
+    stack: list[tuple[Any, int]] = [(blocks, 0)]
+    while stack:
+        node, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes:
+            raise ValueError(
+                f"blocks 节点数超过上限 {max_nodes}"
+                "（可用 TG_RICH_BLOCKS_MAX_NODES 调）"
+            )
+        if depth > BLOCKS_MAX_DEPTH:
+            raise ValueError(f"blocks 嵌套深度超过上限 {BLOCKS_MAX_DEPTH}")
+
+        if isinstance(node, dict):
+            # 语义闸只认结构、不建 schema：命中 map 就验经纬度。
+            if node.get("type") == "map":
+                _guard_map(node)
+            for key, value in node.items():
+                if not isinstance(key, str):
+                    raise ValueError("blocks 里对象的键必须是字符串")
+                stack.append((value, depth + 1))
+        elif isinstance(node, list):
+            if len(node) > BLOCKS_MAX_ARRAY_LEN:
+                raise ValueError(
+                    f"blocks 里单个数组长度超过上限 {BLOCKS_MAX_ARRAY_LEN}"
+                )
+            for item in node:
+                stack.append((item, depth + 1))
+        elif isinstance(node, str):
+            if len(node) > BLOCKS_MAX_STRING_LEN:
+                raise ValueError(
+                    f"blocks 里单个字符串长度超过上限 {BLOCKS_MAX_STRING_LEN} 字符"
+                )
+            total_chars += len(node)
+            if total_chars > max_total_chars:
+                raise ValueError(
+                    f"blocks 字符总量超过上限 {max_total_chars}"
+                    "（可用 TG_RICH_BLOCKS_MAX_CHARS 调）"
+                )
+            _guard_string(node, media_count)
+        elif isinstance(node, (int, float)) or node is None:
+            # JSON 兼容标量（bool 是 int 子类，一并放行）
+            pass
+        else:
+            raise ValueError(
+                "blocks 只允许 JSON 兼容类型（dict/list/str/int/float/bool/null），"
+                f"出现了 {type(node).__name__}"
+            )
+
+
 def build_rich(args: dict[str, Any]) -> dict[str, Any]:
-    """把工具参数拼成 InputRichMessage。三选一的约束在这里守。"""
+    """把工具参数拼成 InputRichMessage。三选一的约束、有界结构闸都在这里守。
+
+    这里是 blocks 的**唯一咽喉**：tg_rich_send / tg_rich_edit / tg_rich_draft 都调它，
+    JSON-string 形式与 list 形式在此汇合后过**同一个** guard_blocks——闸不许每个工具
+    各长一份。
+    """
     markdown = str(args.get("markdown") or "").strip()
     html = str(args.get("html") or "").strip()
     blocks = args.get("blocks")
@@ -321,6 +473,10 @@ def build_rich(args: dict[str, Any]) -> dict[str, Any]:
             f"（这次给了 {sum(given)} 个）"
         )
 
+    # attach://fN 的 N 必须落在实际 media_paths 索引内——数量在这儿就能拿到。
+    media_paths = args.get("media_paths")
+    media_count = len(media_paths) if isinstance(media_paths, list) else 0
+
     rich: dict[str, Any] = {}
     if blocks is not None:
         # 有些 host 会把数组序列化成字符串塞进来，容一下
@@ -331,6 +487,7 @@ def build_rich(args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"blocks 不是合法 JSON：{exc}") from None
         if not isinstance(blocks, list):
             raise ValueError("blocks 必须是数组")
+        guard_blocks(blocks, media_count)
         rich["blocks"] = blocks
     elif markdown:
         rich["markdown"] = markdown
