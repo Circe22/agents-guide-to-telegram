@@ -457,5 +457,92 @@ class McpWiring(unittest.TestCase):
         self.assertTrue(response["result"].get("isError"))
 
 
+class SecurityRegression(unittest.TestCase):
+    """入站窄协议 `ask:<nonce>:<index>` 的安全性质，固定既有行为、零行为改动。
+
+    trust model：入站只有这一条窄协议、单独校验（nonce 精确、index 落域、私聊
+    认人、fullmatch）。这些性质坏了＝别人替她做决定、或旧题/伪造 callback 混进来。
+    **不把 callback 扩成 JSON**——窄协议保持原样。
+    """
+
+    def test_wrong_nonce_ignored_then_valid_wins(self):
+        api = FakeApi(plan=[
+            [],
+            lambda a: [a.click(0, data="ask:ffffffff:0")],   # 别的题的 nonce
+            lambda a: [a.click(2)],
+        ])
+        result = ask(api)
+        self.assertEqual(result["index"], 2)
+        self.assertIn("过期", api.named("answerCallbackQuery")[0][1].get("text", ""))
+
+    def test_non_numeric_index_ignored_then_valid_wins(self):
+        api = FakeApi(plan=[
+            [],
+            lambda a: [a.click(0, data=a.sent_keyboard()[0]["callback_data"]
+                               .rsplit(":", 1)[0] + ":x")],   # index 不是数字
+            lambda a: [a.click(1)],
+        ])
+        self.assertEqual(ask(api)["index"], 1)
+
+    def test_out_of_range_index_ignored_then_valid_wins(self):
+        api = FakeApi(plan=[
+            [],
+            lambda a: [a.click(0, data=a.sent_keyboard()[0]["callback_data"]
+                               .rsplit(":", 1)[0] + ":99")],   # 越界（只有 3 个选项）
+            lambda a: [a.click(0)],
+        ])
+        self.assertEqual(ask(api)["index"], 0)
+
+    def test_prefix_lookalike_not_fullmatch_ignored(self):
+        """长得像但不是 fullmatch——多一截尾巴就不认（正则 fullmatch 的保证）。"""
+        api = FakeApi(plan=[
+            [],
+            lambda a: [a.click(0, data=a.sent_keyboard()[0]["callback_data"]
+                               + " ok")],           # 尾部多东西
+            lambda a: [a.click(0, data="Xask:ffffffff:0")],   # 头部多东西
+            lambda a: [a.click(1)],
+        ])
+        self.assertEqual(ask(api)["index"], 1)
+
+    def test_dm_foreign_user_id_rejected(self):
+        api = FakeApi(plan=[
+            [],
+            lambda a: [a.click(1, from_id="424242")],   # 不是聊天对面那个人
+            lambda a: [a.click(0, from_id="8888")],
+        ])
+        result = ask(api, chat="8888")
+        self.assertEqual(result["index"], 0)
+        self.assertEqual(
+            api.named("answerCallbackQuery")[0][1].get("text"), "Not authorized")
+
+    def test_old_backlog_callback_drained_not_answered(self):
+        """发题前的旧 callback 被 _drain 推过 offset，不会被当成这一题的答案。"""
+        api = FakeApi(plan=[
+            lambda a: [{"update_id": 5000, "callback_query": {
+                "id": "old", "from": {"id": 8888}, "data": "ask:00000000:0"}}],
+            lambda a: [a.click(2)],
+        ])
+        self.assertEqual(ask(api)["index"], 2)
+
+    def test_timed_out_click_does_not_count(self):
+        """超时后那颗按钮已被收走，迟到的点击落在死按钮上、不再产生答案。"""
+        api = FakeApi(plan=[[], lambda a: [a.click(0)]])
+        with self.assertRaises(RuntimeError) as ctx:
+            ask(api, timeout_s=0)
+        self.assertIn("没人点按钮", str(ctx.exception))
+        edits = api.named("editMessageText")
+        self.assertTrue(edits, "超时没收卡＝留了幽灵按钮")
+        self.assertNotIn("reply_markup", edits[0][1], "超时后键盘该被收掉")
+
+    def test_callback_data_far_under_64_bytes(self):
+        """窄协议只带单号+序号，远低于 64 字节硬上限——选项文字一律不进 callback。"""
+        rows = tg_ask.build_keyboard(["A", "B", "C"], "abcd1234", 3)
+        for row in rows:
+            for button in row:
+                self.assertLess(
+                    len(button["callback_data"].encode()), 20,
+                    f"callback_data 竟然逼近 64 上限: {button['callback_data']}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1973,5 +1973,97 @@ class ChatAllowlist(unittest.TestCase):
         self.assertEqual(self.calls[0][0], "sendRichMessage")
 
 
+class AdversarialBlocks(unittest.TestCase):
+    """对抗性 blocks：走**完整工具路径**，拒绝必须发生在任何网络请求之前。
+
+    与 BlocksGuard（单元直调）互补——这里盯的是「闸真挂在出站咽喉上、且拒绝
+    零网络」这一集成性质，以及 JSON-string 与 list 两形式共用同一 guard。
+    """
+
+    def setUp(self):
+        self.calls = []
+        self.original = mcp.call_api
+
+        def fake(method, data, files=None):
+            self.calls.append(method)
+            return {"result": {"message_id": 1}}
+
+        mcp.call_api = fake
+        self.had = {k: os.environ.get(k) for k in ("TG_CHAT_ID", "TG_BOT_TOKEN")}
+        os.environ["TG_CHAT_ID"] = "10001"
+        os.environ["TG_BOT_TOKEN"] = FAKE_TOKEN
+        os.environ.pop("TG_RICH_ALLOWED_CHATS", None)
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _rejected(self, blocks):
+        out = call_tool("tg_rich_send", {"blocks": blocks})
+        self.assertTrue(out["result"]["isError"], "对抗性 payload 竟然放行了")
+        self.assertEqual(self.calls, [], "guard 拒绝前不该有任何网络请求")
+        return out["result"]["content"][0]["text"]
+
+    def test_deep_nesting_rejected_no_network(self):
+        node: Any = {"type": "paragraph", "text": "x"}
+        for _ in range(100):                      # 100 层
+            node = {"type": "details", "blocks": [node]}
+        self._rejected([node])
+
+    def test_giant_single_array_rejected_no_network(self):
+        os.environ["TG_RICH_BLOCKS_MAX_NODES"] = "100000"   # 隔出数组闸
+        try:
+            self._rejected([{"type": "list", "items": [{} for _ in range(5000)]}])
+        finally:
+            os.environ.pop("TG_RICH_BLOCKS_MAX_NODES", None)
+
+    def test_many_small_nodes_rejected_no_network(self):
+        self._rejected([{"type": "paragraph"} for _ in range(3000)])
+
+    def test_huge_string_rejected_no_network(self):
+        self._rejected([{"type": "paragraph", "text": "x" * 200_000}])
+
+    def test_mixed_deep_nesting_rejected_no_network(self):
+        node: Any = "leaf"
+        for i in range(60):                       # dict/list 交替深嵌套
+            node = [{"k": node}] if i % 2 else {"type": "list", "items": [node]}
+        self._rejected([node])
+
+    def test_non_json_type_rejected_no_network(self):
+        self._rejected([{"type": "paragraph", "text": {1, 2, 3}}])   # set 非 JSON
+
+    def test_attach_out_of_range_rejected_no_network(self):
+        self._rejected([{"type": "photo", "photo": {"media": "attach://f999999"}}])
+
+    def test_json_string_and_list_forms_share_guard(self):
+        deep: Any = {"type": "paragraph", "text": "x"}
+        for _ in range(100):
+            deep = {"type": "details", "blocks": [deep]}
+        list_form = [deep]
+        str_form = json.dumps(list_form)
+        # 直调 build_rich：两形式都被同一 guard 拒
+        with self.assertRaises(ValueError):
+            mcp.build_rich({"blocks": list_form})
+        with self.assertRaises(ValueError):
+            mcp.build_rich({"blocks": str_form})
+        # 走工具层：两形式都零网络
+        self.assertTrue(call_tool("tg_rich_send",
+                                  {"blocks": list_form})["result"]["isError"])
+        self.assertTrue(call_tool("tg_rich_send",
+                                  {"blocks": str_form})["result"]["isError"])
+        self.assertEqual(self.calls, [])
+
+    def test_valid_blocks_still_reach_network(self):
+        """反向锚：合法 blocks 照常出门——证明闸拦的是对抗性 payload、不是一刀切。"""
+        out = call_tool("tg_rich_send",
+                        {"blocks": [{"type": "paragraph", "text": "hi"}]})
+        self.assertFalse(out["result"].get("isError"))
+        self.assertEqual(self.calls, ["sendRichMessage"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
