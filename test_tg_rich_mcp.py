@@ -2124,6 +2124,56 @@ class BlocksGuardBudgetR1(unittest.TestCase):
         mcp.guard_blocks([{"type": "paragraph", "text": "hi", "size": 3}])
 
 
+class BlocksGuardFiniteR1(unittest.TestCase):
+    """R1-3：非有限浮点（NaN/±Infinity）双层拦——guard 就地拒 + 出口 allow_nan 兜底。"""
+
+    def test_nan_rejected_by_guard(self):
+        with self.assertRaisesRegex(ValueError, "非有限浮点"):
+            mcp.guard_blocks([{"type": "paragraph", "text": float("nan")}])
+
+    def test_pos_inf_rejected_by_guard(self):
+        with self.assertRaisesRegex(ValueError, "非有限浮点"):
+            mcp.guard_blocks([{"v": float("inf")}])
+
+    def test_neg_inf_rejected_by_guard(self):
+        with self.assertRaisesRegex(ValueError, "非有限浮点"):
+            mcp.guard_blocks([{"v": float("-inf")}])
+
+    def test_finite_floats_ints_bools_pass(self):
+        """反向锚：合法数值/bool/None 照常放行，别把有限数也误伤。"""
+        mcp.guard_blocks([{"type": "map",
+                           "location": {"latitude": 63.4, "longitude": -19.05},
+                           "zoom": 12, "flag": True, "n": 0, "z": None}])
+
+    def test_exit_backstop_rejects_nan_even_if_guard_bypassed(self):
+        """出口兜底：就算 guard 漏了 NaN，json.dumps(allow_nan=False) 也不让它出门。"""
+        original = mcp.guard_blocks
+        orig_api = mcp.call_api
+        calls = []
+        mcp.guard_blocks = lambda *a, **k: None       # 假装 guard 漏了 NaN
+        mcp.call_api = lambda *a, **k: (
+            calls.append(a[0]), {"result": {"message_id": 1}})[1]
+        had = os.environ.get("TG_CHAT_ID")
+        had_allow = os.environ.get("TG_RICH_ALLOWED_CHATS")
+        os.environ["TG_CHAT_ID"] = "10001"
+        os.environ.pop("TG_RICH_ALLOWED_CHATS", None)
+        try:
+            out = call_tool(
+                "tg_rich_send",
+                {"blocks": [{"type": "paragraph", "text": float("nan")}]})
+        finally:
+            mcp.guard_blocks = original
+            mcp.call_api = orig_api
+            if had is None:
+                os.environ.pop("TG_CHAT_ID", None)
+            else:
+                os.environ["TG_CHAT_ID"] = had
+            if had_allow is not None:
+                os.environ["TG_RICH_ALLOWED_CHATS"] = had_allow
+        self.assertTrue(out["result"]["isError"])
+        self.assertEqual(calls, [], "NaN 竟然出门了")
+
+
 @needs_hook
 class ProgressWindowAllowlist(unittest.TestCase):
     """R1-P1a 复现：配了 allowlist、默认 chat 在名单外时，进度窗**一条都不出站**。

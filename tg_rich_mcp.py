@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -491,9 +492,14 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
         elif isinstance(node, str):
             _account_string(node)
             _guard_string(node, media_count)
-        elif isinstance(node, (int, float)) or node is None:
-            # JSON 兼容标量（bool 是 int 子类，一并放行）
+        elif isinstance(node, bool) or node is None:
+            # bool 是 int 子类，得在数值分支之前放行（且不做 isfinite）
             pass
+        elif isinstance(node, (int, float)):
+            # NaN / ±Infinity 能过 isinstance((int,float))，但不是合法 JSON——
+            # json.dumps 默认还会吐出 NaN/Infinity 这种非标准 literal。就地拒（R1-3）。
+            if isinstance(node, float) and not math.isfinite(node):
+                raise ValueError("blocks 里出现非有限浮点（NaN/Infinity），不发")
         else:
             raise ValueError(
                 "blocks 只允许 JSON 兼容类型（dict/list/str/int/float/bool/null），"
@@ -817,7 +823,7 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
                 rich_msg["is_rtl"] = True
             data: dict[str, Any] = {
                 "chat_id": chat,
-                "rich_message": json.dumps(rich_msg, ensure_ascii=False),
+                "rich_message": json.dumps(rich_msg, ensure_ascii=False, allow_nan=False),
             }
             if silent:
                 data["disable_notification"] = "true"
@@ -877,7 +883,7 @@ def tool_send(args: dict[str, Any]) -> str:
         media = load_media(args["media_paths"])
     data: dict[str, Any] = {
         "chat_id": _resolve_chat(args),
-        "rich_message": json.dumps(rich, ensure_ascii=False),
+        "rich_message": json.dumps(rich, ensure_ascii=False, allow_nan=False),
     }
     if args.get("silent"):
         data["disable_notification"] = "true"
@@ -927,7 +933,7 @@ def tool_edit(args: dict[str, Any]) -> str:
     call_api("editMessageText", {
         "chat_id": chat,
         "message_id": message_id,
-        "rich_message": json.dumps(rich, ensure_ascii=False),
+        "rich_message": json.dumps(rich, ensure_ascii=False, allow_nan=False),
     })
     return f"消息 {message_id} 已就地更新（不响铃）"
 
@@ -944,7 +950,7 @@ def tool_draft(args: dict[str, Any]) -> str:
     data: dict[str, Any] = {
         "chat_id": chat,
         "draft_id": draft_id,
-        "rich_message": json.dumps(rich, ensure_ascii=False),
+        "rich_message": json.dumps(rich, ensure_ascii=False, allow_nan=False),
     }
     # can_stop（Bot API 10.3）：给用户一颗停止按钮，解锁被流式占住的输入框。
     # ⚠️ 只开按钮不接事件＝半套：用户按停后服务端**照收**后续帧（2026-09-04
