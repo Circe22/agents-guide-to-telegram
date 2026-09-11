@@ -2065,6 +2065,65 @@ class AdversarialBlocks(unittest.TestCase):
         self.assertEqual(self.calls, ["sendRichMessage"])
 
 
+class BlocksGuardBudgetR1(unittest.TestCase):
+    """R1-2：dict key 纳入字符预算 + 扩栈有界（巨大容器不许一次性全量压栈）。"""
+
+    # ---- key 计入单串长度（变异：拆掉 key 的 _account_string→红） ----
+    def test_huge_dict_key_rejected_by_string_limit(self):
+        with self.assertRaisesRegex(ValueError, "字符串长度"):
+            mcp.guard_blocks([{"k" * 200_001: "v"}])   # 20 万字符的 key
+
+    # ---- key 计入总字符预算 ----
+    def test_dict_keys_counted_in_total_chars(self):
+        # 20 个 key 各 6 万字符：每个 < 单串上限 10 万，合计 120 万 > 100 万
+        big = [{("a" * 60_000 + str(i)): "v"} for i in range(20)]
+        with self.assertRaisesRegex(ValueError, "字符总量"):
+            mcp.guard_blocks(big)
+
+    # ---- 扩栈有界：巨大数组在节点闸触发前不许全量压栈（变异：改回 pop 时计数→红） ----
+    def test_array_push_is_bounded_not_all_at_once(self):
+        counter = [0]
+
+        class _CountingList(list):
+            def __iter__(self):
+                for x in super().__iter__():
+                    counter[0] += 1
+                    yield x
+
+        arr = _CountingList(range(4096))          # ≤ 数组长度上限，只能靠节点闸拦
+        os.environ["TG_RICH_BLOCKS_MAX_NODES"] = "100"
+        try:
+            with self.assertRaisesRegex(ValueError, "节点数"):
+                mcp.guard_blocks([arr])
+        finally:
+            os.environ.pop("TG_RICH_BLOCKS_MAX_NODES", None)
+        self.assertLess(counter[0], 4096,
+                        "节点闸触发前把整个数组都压栈了（扩栈没有界）")
+
+    def test_dict_push_is_bounded_not_all_at_once(self):
+        counter = [0]
+
+        class _CountingDict(dict):
+            def items(self):
+                for kv in super().items():
+                    counter[0] += 1
+                    yield kv
+
+        d = _CountingDict((f"k{i}", i) for i in range(4096))
+        os.environ["TG_RICH_BLOCKS_MAX_NODES"] = "100"
+        try:
+            with self.assertRaisesRegex(ValueError, "节点数"):
+                mcp.guard_blocks([d])
+        finally:
+            os.environ.pop("TG_RICH_BLOCKS_MAX_NODES", None)
+        self.assertLess(counter[0], 4096,
+                        "节点闸触发前把整个 dict 都压栈了（扩栈没有界）")
+
+    def test_ordinary_dict_with_keys_still_passes(self):
+        """反向锚：正常 blocks（key 很短）照常放行，别把 key 预算做成误伤。"""
+        mcp.guard_blocks([{"type": "paragraph", "text": "hi", "size": 3}])
+
+
 @needs_hook
 class ProgressWindowAllowlist(unittest.TestCase):
     """R1-P1a 复现：配了 allowlist、默认 chat 在名单外时，进度窗**一条都不出站**。

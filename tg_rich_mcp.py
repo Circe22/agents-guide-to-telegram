@@ -435,18 +435,40 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
         "TG_RICH_BLOCKS_MAX_CHARS", BLOCKS_MAX_TOTAL_CHARS_DEFAULT
     )
 
-    nodes = 0
+    nodes = 1          # 顶层 blocks 数组算一个
     total_chars = 0
     # 显式栈：(节点, 深度)。顶层 blocks 数组算深度 0，其元素从深度 1 起。
     stack: list[tuple[Any, int]] = [(blocks, 0)]
-    while stack:
-        node, depth = stack.pop()
+
+    def _account_string(text: str) -> None:
+        """字符预算：单串长度 + 总字符量。dict 的 key 与 str 值都过这里（R1-2：
+        key 也占预算，否则 20 万字符的 key 能绕过闸）。"""
+        nonlocal total_chars
+        if len(text) > BLOCKS_MAX_STRING_LEN:
+            raise ValueError(
+                f"blocks 里单个字符串长度超过上限 {BLOCKS_MAX_STRING_LEN} 字符"
+            )
+        total_chars += len(text)
+        if total_chars > max_total_chars:
+            raise ValueError(
+                f"blocks 字符总量超过上限 {max_total_chars}"
+                "（可用 TG_RICH_BLOCKS_MAX_CHARS 调）"
+            )
+
+    def _push(item: Any, depth: int) -> None:
+        """入栈前先计一个节点、先查上限（R1-2：扩栈**有界**——巨大 dict/数组不许
+        在节点闸触发前把全部子节点一次性压进栈里撑爆内存）。"""
+        nonlocal nodes
         nodes += 1
         if nodes > max_nodes:
             raise ValueError(
                 f"blocks 节点数超过上限 {max_nodes}"
                 "（可用 TG_RICH_BLOCKS_MAX_NODES 调）"
             )
+        stack.append((item, depth))
+
+    while stack:
+        node, depth = stack.pop()
         if depth > BLOCKS_MAX_DEPTH:
             raise ValueError(f"blocks 嵌套深度超过上限 {BLOCKS_MAX_DEPTH}")
 
@@ -457,25 +479,17 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
             for key, value in node.items():
                 if not isinstance(key, str):
                     raise ValueError("blocks 里对象的键必须是字符串")
-                stack.append((value, depth + 1))
+                _account_string(key)        # key 纳入字符预算（R1-2）
+                _push(value, depth + 1)     # 逐个计数入栈，扩栈有界（R1-2）
         elif isinstance(node, list):
             if len(node) > BLOCKS_MAX_ARRAY_LEN:
                 raise ValueError(
                     f"blocks 里单个数组长度超过上限 {BLOCKS_MAX_ARRAY_LEN}"
                 )
             for item in node:
-                stack.append((item, depth + 1))
+                _push(item, depth + 1)
         elif isinstance(node, str):
-            if len(node) > BLOCKS_MAX_STRING_LEN:
-                raise ValueError(
-                    f"blocks 里单个字符串长度超过上限 {BLOCKS_MAX_STRING_LEN} 字符"
-                )
-            total_chars += len(node)
-            if total_chars > max_total_chars:
-                raise ValueError(
-                    f"blocks 字符总量超过上限 {max_total_chars}"
-                    "（可用 TG_RICH_BLOCKS_MAX_CHARS 调）"
-                )
+            _account_string(node)
             _guard_string(node, media_count)
         elif isinstance(node, (int, float)) or node is None:
             # JSON 兼容标量（bool 是 int 子类，一并放行）
