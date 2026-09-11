@@ -13,6 +13,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import tg_rich_mcp as mcp
@@ -57,13 +58,15 @@ class R2MediaCapabilityBootstrap(unittest.TestCase):
             api.assert_not_called()
 
     def test_send_real_file_grants_attach_capability(self):
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as fh:
-            fh.write(b"jpg")
-            fh.flush()
+        # Windows 的 NamedTemporaryFile 默认持有独占句柄；load_media 再 open 会被拒。
+        # 用目录 + 已关闭普通文件，覆盖真正的跨平台读路径而不是测试夹具差异。
+        with tempfile.TemporaryDirectory() as td:
+            media_path = Path(td) / "pic.jpg"
+            media_path.write_bytes(b"jpg")
             args = {
                 "chat_id": "10001",
                 "blocks": [{"type": "photo", "photo": {"media": "attach://f0"}}],
-                "media_paths": [fh.name],
+                "media_paths": [str(media_path)],
             }
             with mock.patch.object(
                 mcp, "call_api", return_value={"result": {"message_id": 7}}
