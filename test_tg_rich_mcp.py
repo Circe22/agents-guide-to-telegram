@@ -2065,5 +2065,70 @@ class AdversarialBlocks(unittest.TestCase):
         self.assertEqual(self.calls, ["sendRichMessage"])
 
 
+@needs_hook
+class ProgressWindowAllowlist(unittest.TestCase):
+    """R1-P1a 复现：配了 allowlist、默认 chat 在名单外时，进度窗**一条都不出站**。
+
+    进度窗 hook 曾用裸 _default_chat() 直调 send/edit/delete，绕过 allowlist。
+    修后走 _allowed_default_chat（同一个 _check_chat_allowed），名单外＝当没 chat
+    处理，fail-silent 不炸主流程、更绝不出站。
+    """
+
+    def setUp(self):
+        self.calls = []
+        self.original = mcp.call_api
+        mcp.call_api = lambda method, data, files=None: (
+            self.calls.append(method), {"result": {"message_id": 42}})[1]
+        self.had = {k: os.environ.get(k)
+                    for k in ("TG_CHAT_ID", "TG_RICH_ALLOWED_CHATS",
+                              "TG_PROGRESS_MODE")}
+        os.environ["TG_CHAT_ID"] = "99999"              # 默认 chat（编造）
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"   # 名单只有另一个编造 id
+        os.environ.pop("TG_PROGRESS_MODE", None)        # 默认 edit
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "state.json"
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _write(self, state):
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_edit_frame_denied_chat_zero_outbound(self):
+        self._write({"msg_id": 42, "seq": 9, "lines": ["x"], "total": 9})
+        hook._push(self.path, seq=9)
+        self.assertEqual(self.calls, [], "进度窗把编辑发向了名单外的默认 chat")
+
+    def test_open_window_denied_chat_zero_outbound(self):
+        self._write({"claim": 3, "seq": 3, "lines": ["x"], "total": 1})
+        hook._push(self.path, seq=3)
+        self.assertEqual(self.calls, [], "进度窗把开窗发向了名单外的默认 chat")
+
+    def test_draft_frame_denied_chat_zero_outbound(self):
+        os.environ["TG_PROGRESS_MODE"] = "draft"
+        self._write({"draft_id": 7, "seq": 9, "lines": ["x"], "total": 1})
+        hook._push(self.path, seq=9)
+        self.assertEqual(self.calls, [], "草稿窗把帧发向了名单外的默认 chat")
+
+    def test_cleanup_task_denied_chat_zero_outbound(self):
+        hook._run_cleanup_task(
+            self.path,
+            {"msg_id": 42, "lines": ["x"], "total": 1, "end_mode": "delete"})
+        self.assertEqual(self.calls, [], "收尾清理把请求发向了名单外的默认 chat")
+
+    def test_allowed_chat_still_sends(self):
+        """反向锚：默认 chat 在名单内时照常出站——证明拦的是「名单外」不是全掐。"""
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "99999"
+        self._write({"msg_id": 42, "seq": 9, "lines": ["x"], "total": 9})
+        hook._push(self.path, seq=9)
+        self.assertIn("editMessageText", self.calls)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

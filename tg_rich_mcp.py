@@ -605,6 +605,23 @@ def _check_chat_allowed(chat: str) -> None:
         raise ValueError("目标 chat 不在允许清单内（TG_RICH_ALLOWED_CHATS）")
 
 
+def _allowed_default_chat() -> str:
+    """给 fail-silent 的旁路（进度窗 hook）用的默认 chat 解析。
+
+    返回默认 chat；但配了 allowlist 且默认 chat 不在名单内时返回**空串**——
+    调用方按「没 chat」静默不发（hook 的 fail-silent 约定：拒绝不炸主流程，
+    但**绝不出站**）。与主路径共用同一个 `_check_chat_allowed`，不另开一套校验。
+    """
+    chat = _default_chat()
+    if not chat:
+        return ""
+    try:
+        _check_chat_allowed(chat)
+    except ValueError:
+        return ""
+    return chat
+
+
 def _resolve_chat_raw(args: dict[str, Any]) -> str:
     """解析目标 chat（explicit 优先、其次默认），**不**强制非空；顺带过 allowlist。
 

@@ -413,14 +413,16 @@ def _run_cleanup_task(state_path: Path, task: dict) -> None:
     成功或明确的消息永久不可编辑才确认完成。网络错、429、5xx 以及不能判定为
     永久失效的拒绝均保留任务；每个执行者只尝试队列快照一次，不在这里循环重试。
     """
-    from tg_rich_mcp import _default_chat, call_api  # noqa: PLC0415
+    from tg_rich_mcp import _allowed_default_chat, call_api  # noqa: PLC0415
 
     message_id = int(task.get("msg_id") or 0)
     if not message_id:
         return
-    chat = _default_chat()
+    # 默认 chat 也要过 allowlist（与主路径同一个校验）；被拒＝当「没 chat」处理：
+    # 静默留着、下次再来，绝不发向名单外的 chat。
+    chat = _allowed_default_chat()
     if not chat:
-        return   # 没 chat：先留着，下次再来
+        return   # 没 chat / 名单外：先留着，下次再来
     lines = task.get("lines") or []
     total = int(task.get("total") or 0)
     end_mode = str(task.get("end_mode") or "delete")
@@ -494,7 +496,7 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
     """真正干活的那半——**必须在推送锁里调用**，状态也必须在锁内重读。"""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from tg_rich_mcp import _default_chat, call_api, tool_draft  # noqa: PLC0415
+        from tg_rich_mcp import _allowed_default_chat, call_api, tool_draft  # noqa: PLC0415
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         lines = state.get("lines") or []
@@ -521,7 +523,9 @@ def _push_locked(state_path: Path, seq: int = 0) -> int:
             })
             return 0
 
-        chat = _default_chat()
+        # 默认 chat 过 allowlist（draft 模式走 tool_draft 已在其内部校验）：
+        # 名单外＝当「没 chat」静默返回，进度窗一条都不出站。
+        chat = _allowed_default_chat()
         if not chat:
             return 0
 
