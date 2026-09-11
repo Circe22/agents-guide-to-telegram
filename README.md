@@ -302,7 +302,7 @@ is validated separately.
 | 闸 | env | 默认 | 作用 |
 |---|---|---|---|
 | blocks 有界结构闸 | 常开；`TG_RICH_BLOCKS_MAX_NODES` / `TG_RICH_BLOCKS_MAX_CHARS` 可调 | 深度 16 / 节点 2000 / 单数组 4096 / 单串 10 万 / 总字符 100 万 | 迭代遍历框住 blocks 的深度/节点/数组/字符串/总字符；dict 键必须是 str、只放行 JSON 兼容类型；map 经纬度·缩放、attach 索引、`file://` 本地 scheme 就地判死。拒绝一律在任何网络请求之前，报错不整段回显 payload。 |
-| 媒体目录白名单 | `TG_RICH_MEDIA_ROOTS`（冒号分隔多目录） | **未配＝不限目录** | 只允许发这些目录（及子目录）里的文件；按 `resolve()` 后的真实路径做父子判定（不是字符串前缀），symlink 借链也逃不出去。凭证文件名 guard 仍作第二层。 |
+| 媒体目录白名单 | `TG_RICH_MEDIA_ROOTS`（多目录按 `os.pathsep` 分隔：**Unix `:` / Windows `;`**） | **未配＝不限目录** | 只允许发这些目录（及子目录）里的文件；按 `resolve()` 后的真实路径做父子判定（不是字符串前缀），symlink 借链也逃不出去。凭证文件名 guard 仍作第二层。 |
 | chat 白名单 | `TG_RICH_ALLOWED_CHATS`（逗号分隔） | **未配＝不限** | 配了之后 send / edit / draft / sticker / ask 的目标 chat（**含默认 chat**）都必须在名单内，否则拒发；报错不泄露名单内容。 |
 
 > ⚠️ 两个「未配＝不限」是**刻意的默认兼容取舍**：老配置不动，行为与今日一字不差。

@@ -1851,9 +1851,21 @@ class MediaRoots(unittest.TestCase):
     def test_multi_root(self):
         root2 = self.base / "root2"
         root2.mkdir()
-        os.environ["TG_RICH_MEDIA_ROOTS"] = f"{self.root}:{root2}"
+        # 分隔符随平台：用 os.pathsep.join（Unix ':' / Windows ';'）——硬编码 ':' 在
+        # Windows 上会把 C:\ 盘符切开（R1-4）。
+        os.environ["TG_RICH_MEDIA_ROOTS"] = os.pathsep.join(
+            [str(self.root), str(root2)])
         self.assertEqual(
             list(mcp.load_media([self._mk(root2 / "pic.jpg")])), ["f0"])
+
+    def test_windows_pathsep_does_not_split_drive_letter(self):
+        """模拟 Windows（os.pathsep=';'）：盘符里的 ':' 不该被当分隔符切开。
+        Linux 上 os.pathsep 本就是 ':'，硬编码 ':' 的旧 bug 只在 Windows 现形；
+        这条 patch 出 Windows 环境把它逼出来，也当 R1-4 的变异锚。"""
+        with mock.patch.object(os, "pathsep", ";"):
+            os.environ["TG_RICH_MEDIA_ROOTS"] = r"C:\media;D:\photos"
+            roots = mcp._media_roots()
+        self.assertEqual(len(roots), 2, f"盘符被切开了（期望 2 个 root）：{roots}")
 
     def test_sibling_prefix_dir_rejected(self):
         """兄弟目录名以 root 名为前缀：is_relative_to 拒，字符串 startswith 会假阳。

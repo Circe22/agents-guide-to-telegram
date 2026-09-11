@@ -211,8 +211,10 @@ def _media_guard_on() -> bool:
 
 
 def _media_roots() -> list[Path]:
-    """`TG_RICH_MEDIA_ROOTS`（冒号分隔）解析成 resolve() 后的目录列表。
+    """`TG_RICH_MEDIA_ROOTS`（按 `os.pathsep` 分隔多目录）解析成 resolve() 后的目录列表。
 
+    分隔符随平台：**Unix `:` / Windows `;`**（R1-4）——硬编码 `:` 会把 Windows 的
+    `C:\\...` 盘符从中间切开。
     **未配置＝空列表＝不限目录（维持现状）**——这是刻意的默认兼容取舍：老用户
     不设这个变量，行为与今日一字不差；想收紧到白名单目录的人配上即可（README 写明）。
     """
@@ -220,7 +222,7 @@ def _media_roots() -> list[Path]:
     if not raw:
         return []
     roots: list[Path] = []
-    for chunk in raw.split(":"):
+    for chunk in raw.split(os.pathsep):
         chunk = chunk.strip()
         if chunk:
             roots.append(Path(chunk).expanduser().resolve())
