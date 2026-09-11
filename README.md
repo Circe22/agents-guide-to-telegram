@@ -295,14 +295,15 @@ is validated separately.
 - **入站只有一条窄协议** `ask:<nonce>:<index>`（tg_ask_choice 的按钮回调），
   单独校验：nonce 精确 fullmatch、index 必须落在选项区间内、私聊只认聊天对面
   那个人。Telegram 的消息内容**从不**被映射成 shell / 文件系统 / 任意工具调用。
-- **出站三道有界闸**（见下表）：blocks 结构有界、媒体目录可限、目标 chat 可限。
+- **四道边界闸**（见下表）：JSON-RPC 请求先限字节，blocks 再限结构，媒体目录与目标 chat 均可收紧。
   目标是 **bounding，不是复刻 Telegram 的 schema**——未知 block type 照样透传，
   我们不维护一份会跟 Telegram 漂移的白名单。
 
 | 闸 | env | 默认 | 作用 |
 |---|---|---|---|
-| blocks 有界结构闸 | 常开；`TG_RICH_BLOCKS_MAX_NODES` / `TG_RICH_BLOCKS_MAX_CHARS` 可调 | 深度 16 / 节点 2000 / 单数组 4096 / 单串 10 万 / 总字符 100 万 | 迭代遍历框住 blocks 的深度/节点/数组/字符串/总字符；dict 键必须是 str、只放行 JSON 兼容类型；map 经纬度·缩放、attach 索引、`file://` 本地 scheme 就地判死。拒绝一律在任何网络请求之前，报错不整段回显 payload。 |
-| 媒体目录白名单 | `TG_RICH_MEDIA_ROOTS`（多目录按 `os.pathsep` 分隔：**Unix `:` / Windows `;`**） | **未配＝不限目录** | 只允许发这些目录（及子目录）里的文件；按 `resolve()` 后的真实路径做父子判定（不是字符串前缀），symlink 借链也逃不出去。凭证文件名 guard 仍作第二层。 |
+| JSON-RPC 请求字节闸 | `TG_RICH_MAX_REQUEST_BYTES` | 4 MiB | 在 `json.loads` **之前**按字节有界读取；超长行只保留 `limit+1`，其余用固定窗口 drain 到换行后继续服务，避免巨型请求先把 parser/内存吃满。 |
+| blocks 有界结构闸 | 常开；`TG_RICH_BLOCKS_MAX_NODES` / `TG_RICH_BLOCKS_MAX_CHARS` 可调 | 深度 16 / 节点 2000 / 单数组 4096 / 单串 10 万 / 总字符 100 万 | 迭代遍历框住 blocks 的深度/节点/数组/字符串/总字符；dict 键必须是 str、只放行 JSON 兼容类型。`attach://` / `file:` 只在真正的 `media` / `url` 字段解释，普通 `text` / `pre` 里的字面量不误杀；map 经纬度·缩放仍就地判死。 |
+| 媒体目录白名单 | `TG_RICH_MEDIA_ROOTS`（多目录按 `os.pathsep` 分隔：**Unix `:` / Windows `;`**） | **未配＝不限目录** | 稳定路径下按 `resolve()` 后真实目标做父子判定，普通 symlink 越界会被拦；凭证文件名 guard 仍作第二层。**这不是 race-hard filesystem sandbox**：不承诺抵抗另一个本地进程在检查与 `open()` 之间并发替换路径组件（TOCTOU）。 |
 | chat 白名单 | `TG_RICH_ALLOWED_CHATS`（逗号分隔） | **未配＝不限** | 配了之后 send / edit / draft / sticker / ask 的目标 chat（**含默认 chat**）都必须在名单内，否则拒发；报错不泄露名单内容。 |
 
 > ⚠️ 两个「未配＝不限」是**刻意的默认兼容取舍**：老配置不动，行为与今日一字不差。

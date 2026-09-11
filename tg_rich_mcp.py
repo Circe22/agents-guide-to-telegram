@@ -178,6 +178,44 @@ def _text_error(body: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": _scrub_out(body)}], "isError": True}
 
 
+# ---------- JSON-RPC 传输层字节闸 ----------
+REQUEST_MAX_BYTES_DEFAULT = 4 * 1024 * 1024
+REQUEST_DRAIN_CHUNK = 64 * 1024
+
+
+def _request_max_bytes() -> int:
+    """单条 JSON-RPC 请求最大字节数；坏值/非正数回落 4 MiB。"""
+    raw = (os.environ.get("TG_RICH_MAX_REQUEST_BYTES") or "").strip()
+    try:
+        value = int(raw) if raw else REQUEST_MAX_BYTES_DEFAULT
+    except ValueError:
+        return REQUEST_MAX_BYTES_DEFAULT
+    return value if value > 0 else REQUEST_MAX_BYTES_DEFAULT
+
+
+def _read_request_line(stream: Any, limit: int) -> tuple[Any | None, bool]:
+    """有界读一条换行分隔请求，返回 ``(line, oversized)``。
+
+    首次最多分配 ``limit + 1``；若超限，用固定 64 KiB 窗口把这一行剩余
+    部分 drain 到换行/EOF，再继续下一条。生产路径传 ``sys.stdin.buffer``，
+    因此限制按**字节**生效，且拒绝发生在 ``json.loads`` 之前。
+    """
+    line = stream.readline(limit + 1)
+    if line == b"" or line == "":
+        return None, False
+    if len(line) <= limit:
+        return line, False
+
+    newline = b"\n" if isinstance(line, (bytes, bytearray)) else "\n"
+    empty = b"" if isinstance(line, (bytes, bytearray)) else ""
+    if not line.endswith(newline):
+        while True:
+            tail = stream.readline(REQUEST_DRAIN_CHUNK)
+            if not tail or tail.endswith(newline):
+                break
+    return empty, True
+
+
 # ---------- 媒体上传 ----------
 MEDIA_MAX_BYTES = 50 * 1024 * 1024   # Bot API 上限：上传文件最大 50MB
 MEDIA_MAX_COUNT = 50                  # 官方：一条富消息最多 50 个媒体附件
@@ -401,25 +439,27 @@ def _guard_map(node: dict[str, Any]) -> None:
         raise ValueError(f"map.zoom 要在 [{_ZOOM_RANGE[0]},{_ZOOM_RANGE[1]}] 内")
 
 
-def _guard_string(value: str, media_count: int) -> None:
-    """字符串值的安全闸：attach:// 索引越界、file:// 一类本地 scheme。"""
-    match = _ATTACH_RE.match(value)
-    if match:
-        idx = int(match.group(1))
-        if idx >= media_count:
-            if media_count:
+def _guard_semantic_string(value: str, field: str | None, media_count: int) -> None:
+    """只解释有明确 URL/媒体语义的字段；普通 text/pre/code 字面量不碰。"""
+    if field == "media":
+        match = _ATTACH_RE.fullmatch(value)
+        if match:
+            idx = int(match.group(1))
+            if idx >= media_count:
+                if media_count:
+                    raise ValueError(
+                        f"attach://f{idx} 引用了不存在的媒体——"
+                        f"media_paths 只有 {media_count} 个文件（f0..f{media_count - 1}）"
+                    )
                 raise ValueError(
-                    f"attach://f{idx} 引用了不存在的媒体——"
-                    f"media_paths 只有 {media_count} 个文件（f0..f{media_count - 1}）"
+                    f"attach://f{idx} 引用了媒体，但这次没有提供 media_paths"
                 )
-            raise ValueError(
-                f"attach://f{idx} 引用了媒体，但这次没有提供 media_paths"
-            )
-        return
-    stripped = value.strip().lower()
-    for scheme in _LOCAL_URL_SCHEMES:
-        if stripped.startswith(scheme + ":"):
-            raise ValueError(f"URL 用了本地 scheme（{scheme}:），不发")
+            return
+    if field in ("media", "url"):
+        stripped = value.strip().lower()
+        for scheme in _LOCAL_URL_SCHEMES:
+            if stripped.startswith(scheme + ":"):
+                raise ValueError(f"URL 用了本地 scheme（{scheme}:），不发")
 
 
 def guard_blocks(blocks: Any, media_count: int = 0) -> None:
@@ -441,7 +481,7 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
     nodes = 1          # 顶层 blocks 数组算一个
     total_chars = 0
     # 显式栈：(节点, 深度)。顶层 blocks 数组算深度 0，其元素从深度 1 起。
-    stack: list[tuple[Any, int]] = [(blocks, 0)]
+    stack: list[tuple[Any, int, str | None]] = [(blocks, 0, None)]
 
     def _account_string(text: str) -> None:
         """字符预算：单串长度 + 总字符量。dict 的 key 与 str 值都过这里（R1-2：
@@ -458,7 +498,7 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
                 "（可用 TG_RICH_BLOCKS_MAX_CHARS 调）"
             )
 
-    def _push(item: Any, depth: int) -> None:
+    def _push(item: Any, depth: int, field: str | None = None) -> None:
         """入栈前先计一个节点、先查上限（R1-2：扩栈**有界**——巨大 dict/数组不许
         在节点闸触发前把全部子节点一次性压进栈里撑爆内存）。"""
         nonlocal nodes
@@ -468,10 +508,10 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
                 f"blocks 节点数超过上限 {max_nodes}"
                 "（可用 TG_RICH_BLOCKS_MAX_NODES 调）"
             )
-        stack.append((item, depth))
+        stack.append((item, depth, field))
 
     while stack:
-        node, depth = stack.pop()
+        node, depth, field = stack.pop()
         if depth > BLOCKS_MAX_DEPTH:
             raise ValueError(f"blocks 嵌套深度超过上限 {BLOCKS_MAX_DEPTH}")
 
@@ -483,17 +523,17 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
                 if not isinstance(key, str):
                     raise ValueError("blocks 里对象的键必须是字符串")
                 _account_string(key)        # key 纳入字符预算（R1-2）
-                _push(value, depth + 1)     # 逐个计数入栈，扩栈有界（R1-2）
+                _push(value, depth + 1, key)  # 带字段语义；资源预算仍覆盖所有值
         elif isinstance(node, list):
             if len(node) > BLOCKS_MAX_ARRAY_LEN:
                 raise ValueError(
                     f"blocks 里单个数组长度超过上限 {BLOCKS_MAX_ARRAY_LEN}"
                 )
             for item in node:
-                _push(item, depth + 1)
+                _push(item, depth + 1, field)
         elif isinstance(node, str):
             _account_string(node)
-            _guard_string(node, media_count)
+            _guard_semantic_string(node, field, media_count)
         elif isinstance(node, bool) or node is None:
             # bool 是 int 子类，得在数值分支之前放行（且不做 isfinite）
             pass
@@ -509,7 +549,7 @@ def guard_blocks(blocks: Any, media_count: int = 0) -> None:
             )
 
 
-def build_rich(args: dict[str, Any]) -> dict[str, Any]:
+def build_rich(args: dict[str, Any], *, media_count: int = 0) -> dict[str, Any]:
     """把工具参数拼成 InputRichMessage。三选一的约束、有界结构闸都在这里守。
 
     这里是 blocks 的**唯一咽喉**：tg_rich_send / tg_rich_edit / tg_rich_draft 都调它，
@@ -527,14 +567,16 @@ def build_rich(args: dict[str, Any]) -> dict[str, Any]:
             f"（这次给了 {sum(given)} 个）"
         )
 
-    # attach://fN 的 N 必须落在实际 media_paths 索引内——数量在这儿就能拿到。
-    media_paths = args.get("media_paths")
-    media_count = len(media_paths) if isinstance(media_paths, list) else 0
-
     rich: dict[str, Any] = {}
     if blocks is not None:
         # 有些 host 会把数组序列化成字符串塞进来，容一下
         if isinstance(blocks, str):
+            # string 形式也必须在第二次 json.loads **之前**有界；stdio 主路径外的
+            # 直接调用同样不能先吞一个无界 JSON string 再事后 guard。
+            if len(blocks.encode("utf-8")) > _request_max_bytes():
+                raise ValueError(
+                    "blocks JSON string 超过解析前字节上限（TG_RICH_MAX_REQUEST_BYTES）"
+                )
             try:
                 blocks = json.loads(blocks)
             except json.JSONDecodeError as exc:
@@ -862,27 +904,36 @@ def _send_with_stickers(parts: list[tuple[str, Any]], args: dict[str, Any]) -> s
 
 
 def tool_send(args: dict[str, Any]) -> str:
+    # media_count 是“本调用真的会上传这些附件”的 capability，不从任意 args 隐式推导。
+    media_paths = args.get("media_paths")
+    if media_paths is None:
+        media_count = 0
+    elif isinstance(media_paths, list) and all(isinstance(p, str) for p in media_paths):
+        media_count = len(media_paths)
+    else:
+        raise ValueError("media_paths 必须是字符串数组（本地文件的绝对路径）")
+
     # 公共校验先行：三选一的约束在**任何发送之前**守（build_rich），命中贴纸
     # 分支不该改变参数合同——同样的输入不能因库里有没有那张脸而校验结果不同（B7）。
-    rich = build_rich(args)
+    rich = build_rich(args, media_count=media_count)
 
     # 渲染器模式的第二层：markdown 正文里的（emoji）标记剥成真贴纸，
     # 写到哪儿贴纸跟在哪条后面（位置即语义）。库为空/标记没命中时零开销、零改动。
     markdown_raw = str(args.get("markdown") or "")
-    if markdown_raw.strip() and not args.get("media_paths"):
+    if markdown_raw.strip() and not media_paths:
         parts = tg_sticker.split_message(markdown_raw)
         if any(kind == "sticker" for kind, _ in parts):
             return _send_with_stickers(parts, args)
 
     media = None
-    if args.get("media_paths"):
+    if media_paths:
         if "blocks" not in rich:
             raise ValueError(
                 "media_paths 目前只配 blocks 用：blocks 里放 photo 块、"
                 'media 填 "attach://f0" 引用第 0 个文件'
                 "（markdown/html 的媒体引用是另一套 tg://photo?id=，本工具暂未接）"
             )
-        media = load_media(args["media_paths"])
+        media = load_media(media_paths)
     data: dict[str, Any] = {
         "chat_id": _resolve_chat(args),
         "rich_message": json.dumps(rich, ensure_ascii=False, allow_nan=False),
@@ -920,6 +971,8 @@ def tool_edit(args: dict[str, Any]) -> str:
     这是**持久进度窗**的做法：开工先 tg_rich_send 发一条，记住 message_id，
     之后每帧 edit 它——不受草稿 30 秒的限制、留在聊天记录里、编辑不响铃。
     """
+    if "media_paths" in args:
+        raise ValueError("media_paths 只支持 tg_rich_send；tg_rich_edit 不上传附件")
     chat = _resolve_chat(args)
     message_id = _int_arg(args, "message_id", "tg_rich_send 返回的那个 id")
     if not message_id:
@@ -941,6 +994,8 @@ def tool_edit(args: dict[str, Any]) -> str:
 
 
 def tool_draft(args: dict[str, Any]) -> str:
+    if "media_paths" in args:
+        raise ValueError("media_paths 只支持 tg_rich_send；tg_rich_draft 不上传附件")
     draft_id = _int_arg(args, "draft_id", "任意非零整数，同一个 id 才会做动画过渡")
     if not draft_id:
         raise ValueError("draft_id 必须是非零整数（同一个 id 的连续调用才会做动画过渡）")
@@ -1351,25 +1406,39 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> None:
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-            if not isinstance(message, dict):
-                raise ValueError("request must be an object")
-            response = handle(message)
-        except (json.JSONDecodeError, ValueError) as exc:
-            response = _error(None, -32700, str(exc))
-        except Exception as exc:
-            # 单条消息的最终兜底：任何没预料到的异常都不许掀掉读循环，
-            # 也不许把 traceback 打上 stderr——server 一崩，整个 MCP 就掉线了。
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    limit = _request_max_bytes()
+    while True:
+        raw_line, oversized = _read_request_line(stream, limit)
+        if raw_line is None:
+            break
+        message: Any = None
+        if oversized:
             response = _error(
-                message.get("id") if isinstance(message, dict) else None,
-                -32603,
-                f"internal error: {type(exc).__name__}",
+                None, -32600,
+                f"request exceeds {limit} byte limit (TG_RICH_MAX_REQUEST_BYTES)",
             )
+        else:
+            try:
+                if isinstance(raw_line, (bytes, bytearray)):
+                    line = bytes(raw_line).decode("utf-8").strip()
+                else:
+                    line = str(raw_line).strip()
+                if not line:
+                    continue
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError("request must be an object")
+                response = handle(message)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                response = _error(None, -32700, str(exc))
+            except Exception as exc:
+                # 单条消息的最终兜底：任何没预料到的异常都不许掀掉读循环。
+                response = _error(
+                    message.get("id") if isinstance(message, dict) else None,
+                    -32603,
+                    f"internal error: {type(exc).__name__}",
+                )
         if response is not None:
             sys.stdout.write(
                 json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
