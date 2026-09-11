@@ -1,0 +1,403 @@
+name: one-shot-r2-security-fix
+
+on:
+  push:
+    branches: ["chatgpt/r2-security-fix"]
+    paths: [".github/workflows/r2-self-apply.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/r2-security-fix
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install requests
+      - name: Apply focused R2 patch
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("tg_rich_mcp.py")
+          s = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str) -> None:
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one match, got {count}: {old[:100]!r}")
+              s = s.replace(old, new, 1)
+
+          # R2-2: bound the stdio request before json.loads sees it. Actual main() uses
+          # sys.stdin.buffer, so the limit is bytes rather than Python characters.
+          request_guard = r'''# ---------- JSON-RPC 传输层字节闸 ----------
+          REQUEST_MAX_BYTES_DEFAULT = 4 * 1024 * 1024
+          REQUEST_DRAIN_CHUNK = 64 * 1024
+
+
+          def _request_max_bytes() -> int:
+              """单条 JSON-RPC 请求最大字节数；坏值/非正数回落 4 MiB。"""
+              raw = (os.environ.get("TG_RICH_MAX_REQUEST_BYTES") or "").strip()
+              try:
+                  value = int(raw) if raw else REQUEST_MAX_BYTES_DEFAULT
+              except ValueError:
+                  return REQUEST_MAX_BYTES_DEFAULT
+              return value if value > 0 else REQUEST_MAX_BYTES_DEFAULT
+
+
+          def _read_request_line(stream: Any, limit: int) -> tuple[Any | None, bool]:
+              """有界读取一条换行分隔请求，返回 (line, oversized)。
+
+              首次最多分配 limit+1；若超限，用固定 64 KiB 窗口把这一行剩余部分
+              drain 到换行/EOF，再让下一条请求继续。拒绝发生在 json.loads 之前。
+              main() 传 sys.stdin.buffer，因此生产路径按**字节**计；text stream 仅供
+              嵌入/测试兼容，此时 len() 是字符数。
+              """
+              line = stream.readline(limit + 1)
+              if line == b"" or line == "":
+                  return None, False
+              if len(line) <= limit:
+                  return line, False
+
+              newline = b"\n" if isinstance(line, (bytes, bytearray)) else "\n"
+              empty = b"" if isinstance(line, (bytes, bytearray)) else ""
+              if not line.endswith(newline):
+                  while True:
+                      tail = stream.readline(REQUEST_DRAIN_CHUNK)
+                      if not tail or tail.endswith(newline):
+                          break
+              return empty, True
+          '''
+          marker = "# ---------- 媒体上传 ----------"
+          if "REQUEST_MAX_BYTES_DEFAULT" in s:
+              raise SystemExit("request guard already exists")
+          replace_once(marker, request_guard + "\n\n" + marker)
+
+          # R2-1: resource accounting applies to every string, but media/url semantics
+          # only apply to fields whose key actually carries those semantics.
+          start = s.index("def _guard_string(")
+          end = s.index("\n\ndef guard_blocks", start)
+          semantic_guard = r'''def _guard_semantic_string(value: str, field: str | None, media_count: int) -> None:
+              """只解释有明确 URL/媒体语义的字段；普通 text/pre/code 字面量不碰。"""
+              if field == "media":
+                  match = _ATTACH_RE.fullmatch(value)
+                  if match:
+                      idx = int(match.group(1))
+                      if idx >= media_count:
+                          if media_count:
+                              raise ValueError(
+                                  f"attach://f{idx} 引用了不存在的媒体——"
+                                  f"media_paths 只有 {media_count} 个文件（f0..f{media_count - 1}）"
+                              )
+                          raise ValueError(
+                              f"attach://f{idx} 引用了媒体，但这次没有提供 media_paths"
+                          )
+                      return
+              if field in ("media", "url"):
+                  stripped = value.strip().lower()
+                  for scheme in _LOCAL_URL_SCHEMES:
+                      if stripped.startswith(scheme + ":"):
+                          raise ValueError(f"URL 用了本地 scheme（{scheme}:），不发")
+          '''
+          s = s[:start] + semantic_guard + s[end:]
+
+          replace_once(
+              "    stack: list[tuple[Any, int]] = [(blocks, 0)]",
+              "    stack: list[tuple[Any, int, str | None]] = [(blocks, 0, None)]",
+          )
+          replace_once(
+              "    def _push(item: Any, depth: int) -> None:",
+              "    def _push(item: Any, depth: int, field: str | None = None) -> None:",
+          )
+          replace_once(
+              "        stack.append((item, depth))",
+              "        stack.append((item, depth, field))",
+          )
+          replace_once(
+              "        node, depth = stack.pop()",
+              "        node, depth, field = stack.pop()",
+          )
+          replace_once(
+              "                _push(value, depth + 1)     # 逐个计数入栈，扩栈有界（R1-2）",
+              "                _push(value, depth + 1, key)  # 带字段语义；资源预算仍对所有值生效",
+          )
+          replace_once(
+              "                _push(item, depth + 1)",
+              "                _push(item, depth + 1, field)",
+          )
+          replace_once(
+              "        elif isinstance(node, str):\n            _account_string(node)\n            _guard_string(node, media_count)",
+              "        elif isinstance(node, str):\n            _account_string(node)\n            _guard_semantic_string(node, field, media_count)",
+          )
+
+          # R3: media_count is a capability granted explicitly by the actual send path.
+          replace_once(
+              "def build_rich(args: dict[str, Any]) -> dict[str, Any]:",
+              "def build_rich(args: dict[str, Any], *, media_count: int = 0) -> dict[str, Any]:",
+          )
+          replace_once(
+              "    # attach://fN 的 N 必须落在实际 media_paths 索引内——数量在这儿就能拿到。\n"
+              "    media_paths = args.get(\"media_paths\")\n"
+              "    media_count = len(media_paths) if isinstance(media_paths, list) else 0\n\n",
+              "",
+          )
+
+          send_start = s.index("def tool_send(")
+          send_end = s.index("\n\ndef tool_edit", send_start)
+          send = s[send_start:send_end]
+          old = "    rich = build_rich(args)\n"
+          if send.count(old) != 1:
+              raise SystemExit("tool_send build_rich anchor drifted")
+          send = send.replace(old, r'''    media_paths = args.get("media_paths")
+              if media_paths is None:
+                  media_count = 0
+              elif isinstance(media_paths, list):
+                  media_count = len(media_paths)
+              else:
+                  raise ValueError("media_paths 必须是字符串数组（本地文件的绝对路径）")
+              rich = build_rich(args, media_count=media_count)
+          ''', 1)
+          send = send.replace('if markdown_raw.strip() and not args.get("media_paths"):',
+                              'if markdown_raw.strip() and not media_paths:', 1)
+          send = send.replace('if args.get("media_paths"):', 'if media_paths:', 1)
+          send = send.replace('media = load_media(args["media_paths"])',
+                              'media = load_media(media_paths)', 1)
+          s = s[:send_start] + send + s[send_end:]
+
+          edit_start = s.index("def tool_edit(")
+          edit_end = s.index("\n\ndef tool_draft", edit_start)
+          edit = s[edit_start:edit_end]
+          anchor = "    chat = _resolve_chat(args)\n"
+          if edit.count(anchor) != 1:
+              raise SystemExit("tool_edit chat anchor drifted")
+          edit = edit.replace(anchor,
+              "    if \"media_paths\" in args:\n"
+              "        raise ValueError(\"media_paths 只支持 tg_rich_send；tg_rich_edit 不上传附件\")\n"
+              + anchor, 1)
+          s = s[:edit_start] + edit + s[edit_end:]
+
+          draft_start = s.index("def tool_draft(")
+          draft_end = s.index("\n\n# ---------- 工具 schema", draft_start)
+          draft = s[draft_start:draft_end]
+          anchor = "    draft_id = _int_arg(args, \"draft_id\", \"任意非零整数，同一个 id 才会做动画过渡\")\n"
+          if draft.count(anchor) != 1:
+              raise SystemExit("tool_draft anchor drifted")
+          draft = draft.replace(anchor,
+              "    if \"media_paths\" in args:\n"
+              "        raise ValueError(\"media_paths 只支持 tg_rich_send；tg_rich_draft 不上传附件\")\n"
+              + anchor, 1)
+          s = s[:draft_start] + draft + s[draft_end:]
+
+          # Replace main as one unit so the oversized branch can never reach json.loads.
+          main_start = s.index("def main() -> None:")
+          main_end = s.index("\n\nif __name__ == \"__main__\":", main_start)
+          new_main = r'''def main() -> None:
+              stream = getattr(sys.stdin, "buffer", sys.stdin)
+              limit = _request_max_bytes()
+              while True:
+                  raw_line, oversized = _read_request_line(stream, limit)
+                  if raw_line is None:
+                      break
+                  message: Any = None
+                  if oversized:
+                      response = _error(
+                          None, -32600,
+                          f"request exceeds {limit} byte limit (TG_RICH_MAX_REQUEST_BYTES)",
+                      )
+                  else:
+                      try:
+                          if isinstance(raw_line, (bytes, bytearray)):
+                              line = bytes(raw_line).decode("utf-8").strip()
+                          else:
+                              line = str(raw_line).strip()
+                          if not line:
+                              continue
+                          message = json.loads(line)
+                          if not isinstance(message, dict):
+                              raise ValueError("request must be an object")
+                          response = handle(message)
+                      except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                          response = _error(None, -32700, str(exc))
+                      except Exception as exc:
+                          # 单条消息的最终兜底：任何没预料到的异常都不许掀掉读循环。
+                          response = _error(
+                              message.get("id") if isinstance(message, dict) else None,
+                              -32603,
+                              f"internal error: {type(exc).__name__}",
+                          )
+                  if response is not None:
+                      sys.stdout.write(
+                          json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
+                      )
+                      sys.stdout.flush()
+          '''
+          s = s[:main_start] + new_main + s[main_end:]
+          path.write_text(s, encoding="utf-8")
+
+          # Focused regression tests live separately; unittest discover picks them up.
+          Path("test_security_boundaries_r2.py").write_text(r'''import io
+          import json
+          import os
+          import tempfile
+          import unittest
+          from unittest import mock
+
+          import tg_rich_mcp as mcp
+
+
+          class SemanticStringScope(unittest.TestCase):
+              def test_plain_text_literals_are_not_interpreted(self):
+                  mcp.guard_blocks([
+                      {"type": "pre", "text": "file:///etc/passwd"},
+                      {"type": "paragraph", "text": "example attach://f999999 only"},
+                  ])
+
+              def test_media_attach_still_checked(self):
+                  with self.assertRaisesRegex(ValueError, "attach"):
+                      mcp.guard_blocks(
+                          [{"type": "photo", "photo": {"media": "attach://f3"}}],
+                          media_count=1,
+                      )
+
+              def test_media_and_url_file_scheme_still_rejected(self):
+                  for blocks in (
+                      [{"type": "photo", "photo": {"media": "file:///etc/passwd"}}],
+                      [{"type": "paragraph", "text": [
+                          {"type": "url", "text": "x", "url": "file:///etc/passwd"}
+                      ]}],
+                  ):
+                      with self.subTest(blocks=blocks):
+                          with self.assertRaisesRegex(ValueError, "本地 scheme"):
+                              mcp.guard_blocks(blocks)
+
+              def test_valid_media_attach_uses_explicit_capability(self):
+                  mcp.build_rich(
+                      {"blocks": [{"type": "photo", "photo": {"media": "attach://f0"}}]},
+                      media_count=1,
+                  )
+                  with self.assertRaisesRegex(ValueError, "attach"):
+                      mcp.build_rich(
+                          {"blocks": [{"type": "photo", "photo": {"media": "attach://f0"}}]}
+                      )
+
+
+          class MediaCapabilityBoundary(unittest.TestCase):
+              def test_edit_cannot_fake_media_paths(self):
+                  args = {
+                      "chat_id": "10001", "message_id": 1,
+                      "blocks": [{"type": "photo", "photo": {"media": "attach://f0"}}],
+                      "media_paths": ["/tmp/not-really-uploaded.jpg"],
+                  }
+                  with mock.patch.object(mcp, "call_api") as api:
+                      with self.assertRaisesRegex(ValueError, "只支持 tg_rich_send"):
+                          mcp.tool_edit(args)
+                      api.assert_not_called()
+
+              def test_draft_cannot_fake_media_paths(self):
+                  args = {
+                      "chat_id": "10001", "draft_id": 1,
+                      "blocks": [{"type": "photo", "photo": {"media": "attach://f0"}}],
+                      "media_paths": ["/tmp/not-really-uploaded.jpg"],
+                  }
+                  with mock.patch.object(mcp, "call_api") as api:
+                      with self.assertRaisesRegex(ValueError, "只支持 tg_rich_send"):
+                          mcp.tool_draft(args)
+                      api.assert_not_called()
+
+              def test_send_real_media_path_authorizes_attach(self):
+                  with tempfile.NamedTemporaryFile(suffix=".jpg") as fh:
+                      fh.write(b"jpg")
+                      fh.flush()
+                      args = {
+                          "chat_id": "10001",
+                          "blocks": [{"type": "photo", "photo": {"media": "attach://f0"}}],
+                          "media_paths": [fh.name],
+                      }
+                      with mock.patch.object(
+                          mcp, "call_api", return_value={"result": {"message_id": 7}}
+                      ) as api:
+                          mcp.tool_send(args)
+                      self.assertEqual(api.call_args.args[0], "sendRichMessage")
+                      self.assertIn("f0", api.call_args.kwargs["files"])
+
+
+          class TransportByteBound(unittest.TestCase):
+              def test_oversized_line_is_drained_and_next_request_survives(self):
+                  stream = io.BytesIO(b"x" * 200_000 + b"\n" + b'{"jsonrpc":"2.0"}\n')
+                  line, oversized = mcp._read_request_line(stream, 64)
+                  self.assertTrue(oversized)
+                  self.assertEqual(line, b"")
+                  line, oversized = mcp._read_request_line(stream, 64)
+                  self.assertFalse(oversized)
+                  self.assertEqual(line, b'{"jsonrpc":"2.0"}\n')
+
+              def test_limit_is_bytes_for_multibyte_utf8(self):
+                  stream = io.BytesIO("猫猫\n".encode("utf-8"))
+                  _line, oversized = mcp._read_request_line(stream, 6)
+                  self.assertTrue(oversized)
+
+              def test_main_returns_error_then_continues(self):
+                  oversized = b"x" * 100 + b"\n"
+                  ping = b'{"jsonrpc":"2.0","id":9,"method":"ping"}\n'
+
+                  class FakeStdin:
+                      def __init__(self, data: bytes):
+                          self.buffer = io.BytesIO(data)
+
+                  out = io.StringIO()
+                  with mock.patch.dict(os.environ, {"TG_RICH_MAX_REQUEST_BYTES": "64"}), \
+                       mock.patch.object(mcp.sys, "stdin", FakeStdin(oversized + ping)), \
+                       mock.patch.object(mcp.sys, "stdout", out):
+                      mcp.main()
+                  responses = [json.loads(line) for line in out.getvalue().splitlines()]
+                  self.assertEqual(responses[0]["error"]["code"], -32600)
+                  self.assertEqual(responses[1]["id"], 9)
+                  self.assertEqual(responses[1]["result"], {})
+
+              def test_bad_env_falls_back(self):
+                  with mock.patch.dict(os.environ, {"TG_RICH_MAX_REQUEST_BYTES": "nope"}):
+                      self.assertEqual(mcp._request_max_bytes(), mcp.REQUEST_MAX_BYTES_DEFAULT)
+
+
+          if __name__ == "__main__":
+              unittest.main(verbosity=2)
+          '''.replace("\n          ", "\n").lstrip(), encoding="utf-8")
+
+          readme = Path("README.md")
+          r = readme.read_text(encoding="utf-8")
+          lines = []
+          saw_blocks = saw_media = False
+          for line in r.splitlines():
+              if line.startswith("| blocks 有界结构闸 |"):
+                  lines.append("| JSON-RPC 请求字节闸 | `TG_RICH_MAX_REQUEST_BYTES` | 4 MiB | 在 `json.loads` **之前**按字节有界读取；超长行只保留 `limit+1`，其余用固定窗口 drain 到换行后继续服务，避免巨型请求先把 parser/内存吃满。 |")
+                  lines.append("| blocks 有界结构闸 | 常开；`TG_RICH_BLOCKS_MAX_NODES` / `TG_RICH_BLOCKS_MAX_CHARS` 可调 | 深度 16 / 节点 2000 / 单数组 4096 / 单串 10 万 / 总字符 100 万 | 迭代遍历框住结构资源；dict 键必须是 str、只放行 JSON 兼容类型。`attach://` / `file:` 只在真正的 `media` / `url` 字段解释，普通 `text` / `pre` 里的字面量不误杀；map 经纬度·缩放仍就地判死。 |")
+                  saw_blocks = True
+              elif line.startswith("| 媒体目录白名单 |"):
+                  lines.append("| 媒体目录白名单 | `TG_RICH_MEDIA_ROOTS`（多目录按 `os.pathsep` 分隔：**Unix `:` / Windows `;`**） | **未配＝不限目录** | 稳定路径下按 `resolve()` 后真实目标做父子判定，普通 symlink 越界会被拦；凭证文件名 guard 仍作第二层。**这不是 race-hard filesystem sandbox**：不承诺抵抗另一个本地进程在检查与 `open()` 之间并发替换路径组件（TOCTOU）。 |")
+                  saw_media = True
+              else:
+                  lines.append(line)
+          if not (saw_blocks and saw_media):
+              raise SystemExit(f"README security table anchors missing: blocks={saw_blocks} media={saw_media}")
+          readme.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+      - name: Run full test suite
+        run: python -m unittest discover -v
+      - name: Commit tested patch and remove one-shot workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/r2-self-apply.yml
+          git config user.name "ChatGPT"
+          git config user.email "noreply@openai.com"
+          git add tg_rich_mcp.py README.md test_security_boundaries_r2.py
+          git commit -m "security: close second-order Telegram parsing boundaries"
+          git push origin HEAD:chatgpt/r2-security-fix
