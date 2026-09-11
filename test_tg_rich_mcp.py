@@ -1796,5 +1796,182 @@ class BlocksGuard(unittest.TestCase):
             mcp.build_rich({"blocks": [node]})
 
 
+class MediaRoots(unittest.TestCase):
+    """TG_RICH_MEDIA_ROOTS 目录边界。坏了＝任意路径的文件都能被发出去。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name).resolve()
+        self.root = self.base / "root"
+        self.root.mkdir()
+        self.outside = self.base / "outside"
+        self.outside.mkdir()
+
+    def tearDown(self):
+        os.environ.pop("TG_RICH_MEDIA_ROOTS", None)
+        self.tmp.cleanup()
+
+    def _mk(self, path: Path, content: bytes = b"\xff\xd8jpg") -> str:
+        path.write_bytes(content)
+        return str(path)
+
+    def test_file_inside_root_passes(self):
+        os.environ["TG_RICH_MEDIA_ROOTS"] = str(self.root)
+        self.assertEqual(
+            list(mcp.load_media([self._mk(self.root / "pic.jpg")])), ["f0"])
+
+    def test_file_outside_root_rejected(self):
+        os.environ["TG_RICH_MEDIA_ROOTS"] = str(self.root)
+        with self.assertRaisesRegex(ValueError, "允许的媒体目录"):
+            mcp.load_media([self._mk(self.outside / "pic.jpg")])
+
+    def test_parent_escape_rejected(self):
+        os.environ["TG_RICH_MEDIA_ROOTS"] = str(self.root)
+        self._mk(self.outside / "pic.jpg")
+        escape = str(self.root / ".." / "outside" / "pic.jpg")   # 用 ../ 逃出去
+        with self.assertRaisesRegex(ValueError, "允许的媒体目录"):
+            mcp.load_media([escape])
+
+    def test_symlink_escaping_root_rejected(self):
+        """链接在 root 内，真实目标在外——按 resolve 后的真实目标判，拒。"""
+        os.environ["TG_RICH_MEDIA_ROOTS"] = str(self.root)
+        target = Path(self._mk(self.outside / "target.jpg"))
+        link = self.root / "innocent.jpg"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "允许的媒体目录"):
+            mcp.load_media([str(link)])
+
+    def test_symlink_within_root_passes(self):
+        os.environ["TG_RICH_MEDIA_ROOTS"] = str(self.root)
+        target = Path(self._mk(self.root / "real.jpg"))
+        link = self.root / "alias.jpg"
+        link.symlink_to(target)
+        self.assertEqual(list(mcp.load_media([str(link)])), ["f0"])
+
+    def test_multi_root(self):
+        root2 = self.base / "root2"
+        root2.mkdir()
+        os.environ["TG_RICH_MEDIA_ROOTS"] = f"{self.root}:{root2}"
+        self.assertEqual(
+            list(mcp.load_media([self._mk(root2 / "pic.jpg")])), ["f0"])
+
+    def test_sibling_prefix_dir_rejected(self):
+        """兄弟目录名以 root 名为前缀：is_relative_to 拒，字符串 startswith 会假阳。
+        这条钉住「必须父子判定、不许 startswith」。"""
+        sibling = self.base / "root_evil"   # 与 self.root 同前缀
+        sibling.mkdir()
+        os.environ["TG_RICH_MEDIA_ROOTS"] = str(self.root)
+        with self.assertRaisesRegex(ValueError, "允许的媒体目录"):
+            mcp.load_media([self._mk(sibling / "pic.jpg")])
+
+    def test_unset_means_no_restriction(self):
+        """不配＝维持现状：root 外的文件照发（同时兼当变异锚——拆掉 roots 检查后，
+        上面的越界测试全绿）。"""
+        self.assertEqual(
+            list(mcp.load_media([self._mk(self.outside / "pic.jpg")])), ["f0"])
+
+
+class ChatAllowlist(unittest.TestCase):
+    """TG_RICH_ALLOWED_CHATS。坏了＝配了名单也能往名单外的 chat 发。"""
+
+    def setUp(self):
+        self.original = mcp.call_api
+        self.calls = []
+
+        def fake(method, data, files=None):
+            self.calls.append((method, dict(data)))
+            return {"result": {"message_id": 1}}
+
+        mcp.call_api = fake
+        self.had = {k: os.environ.get(k)
+                    for k in ("TG_CHAT_ID", "TG_BOT_TOKEN")}
+        os.environ["TG_BOT_TOKEN"] = FAKE_TOKEN
+        os.environ.pop("TG_CHAT_ID", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["TG_STICKER_DIR"] = self.tmp.name   # 空库＝贴纸层不掺和
+        mcp._LAST_SENT.clear()
+
+    def tearDown(self):
+        mcp.call_api = self.original
+        for k, v in self.had.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        os.environ.pop("TG_RICH_ALLOWED_CHATS", None)
+        os.environ.pop("TG_STICKER_DIR", None)
+        mcp._LAST_SENT.clear()
+        self.tmp.cleanup()
+
+    # ---- 解析层 ----
+    def test_allowed_explicit_chat_passes(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001,10002"
+        self.assertEqual(mcp._resolve_chat({"chat_id": "10001"}), "10001")
+
+    def test_denied_explicit_chat_rejected(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        with self.assertRaises(ValueError):
+            mcp._resolve_chat({"chat_id": "99999"})
+
+    def test_default_chat_also_checked(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        os.environ["TG_CHAT_ID"] = "99999"     # 默认 chat 不在名单
+        with self.assertRaises(ValueError):
+            mcp._resolve_chat({})              # 不给 chat_id，走默认
+        os.environ["TG_CHAT_ID"] = "10001"     # 默认 chat 在名单
+        self.assertEqual(mcp._resolve_chat({}), "10001")
+
+    def test_unset_means_no_restriction(self):
+        self.assertEqual(mcp._resolve_chat({"chat_id": "whatever"}), "whatever")
+
+    def test_error_does_not_leak_allowlist(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "SECRET_CHAT_9988,OTHER_7766"
+        with self.assertRaises(ValueError) as ctx:
+            mcp._resolve_chat({"chat_id": "99999"})
+        self.assertNotIn("SECRET_CHAT_9988", str(ctx.exception))
+        self.assertNotIn("OTHER_7766", str(ctx.exception))
+
+    # ---- 端到端：五类工具都拦得住，且拒绝发生在网络之前 ----
+    def test_send_denied_before_network(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        out = call_tool("tg_rich_send", {"markdown": "hi", "chat_id": "99999"})
+        self.assertTrue(out["result"]["isError"])
+        self.assertEqual(self.calls, [])
+
+    def test_edit_denied_before_network(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        out = call_tool("tg_rich_edit",
+                        {"markdown": "hi", "chat_id": "99999", "message_id": 5})
+        self.assertTrue(out["result"]["isError"])
+        self.assertEqual(self.calls, [])
+
+    def test_draft_denied_before_network(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        out = call_tool("tg_rich_draft",
+                        {"markdown": "hi", "chat_id": "99999", "draft_id": 1})
+        self.assertTrue(out["result"]["isError"])
+        self.assertEqual(self.calls, [])
+
+    def test_sticker_denied_before_network(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        out = call_tool("tg_sticker_send", {"emoji": "😀", "chat_id": "99999"})
+        self.assertTrue(out["result"]["isError"])
+        self.assertEqual(self.calls, [])
+
+    def test_ask_denied_before_network(self):
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        out = call_tool("tg_ask_choice",
+                        {"question": "q", "options": ["a", "b"], "chat_id": "99999"})
+        self.assertTrue(out["result"]["isError"])
+        self.assertEqual(self.calls, [])
+
+    def test_allowed_send_reaches_api(self):
+        """名单内照常发——证明拦的是「不在名单」而非把所有发送都掐了。"""
+        os.environ["TG_RICH_ALLOWED_CHATS"] = "10001"
+        out = call_tool("tg_rich_send", {"markdown": "hi", "chat_id": "10001"})
+        self.assertFalse(out["result"].get("isError"))
+        self.assertEqual(self.calls[0][0], "sendRichMessage")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

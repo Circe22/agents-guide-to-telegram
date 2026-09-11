@@ -209,11 +209,35 @@ def _media_guard_on() -> bool:
     return os.environ.get("TG_RICH_MEDIA_GUARD", "1").strip() != "0"
 
 
+def _media_roots() -> list[Path]:
+    """`TG_RICH_MEDIA_ROOTS`（冒号分隔）解析成 resolve() 后的目录列表。
+
+    **未配置＝空列表＝不限目录（维持现状）**——这是刻意的默认兼容取舍：老用户
+    不设这个变量，行为与今日一字不差；想收紧到白名单目录的人配上即可（README 写明）。
+    """
+    raw = (os.environ.get("TG_RICH_MEDIA_ROOTS") or "").strip()
+    if not raw:
+        return []
+    roots: list[Path] = []
+    for chunk in raw.split(":"):
+        chunk = chunk.strip()
+        if chunk:
+            roots.append(Path(chunk).expanduser().resolve())
+    return roots
+
+
+def _within_roots(real: Path, roots: list[Path]) -> bool:
+    """真实路径是否落在某个 root 内——用 `is_relative_to` 做父子判定，
+    **绝不用字符串 startswith**（`/a/bc` startswith `/a/b` 会假阳）。"""
+    return any(real == root or real.is_relative_to(root) for root in roots)
+
+
 def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
     """把 media_paths 读成 multipart 字典：第 i 个路径 → 附件名 f{i}。
 
     blocks 里用 attach://f0 引用第 0 个文件，以此类推。
-    符号链接按**真实目标**检查——链接名无害不代表指向的东西无害。
+    符号链接按**真实目标**检查——链接名无害不代表指向的东西无害；
+    配了 TG_RICH_MEDIA_ROOTS 时，符号链接也不得借链逃出 roots（按 resolve 后的真实目标判）。
     """
     if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
         raise ValueError("media_paths 必须是字符串数组（本地文件的绝对路径）")
@@ -223,11 +247,19 @@ def load_media(paths: Any) -> dict[str, tuple[str, bytes]]:
     files: dict[str, tuple[str, bytes]] = {}
     budget = _media_total_budget()
     total = 0
+    roots = _media_roots()
     for i, raw in enumerate(paths):
         path = Path(raw).expanduser()
         if not path.is_file():
             raise ValueError(f"media_paths[{i}] 不是文件：{raw}")
         real = path.resolve()
+        # 目录边界（第一层）：配了 roots 就必须落在里面。按 resolve 后的真实目标判，
+        # symlink 借链逃出 roots 会在这里被拦。未配 roots＝不设限（默认兼容）。
+        if roots and not _within_roots(real, roots):
+            raise ValueError(
+                f"media_paths[{i}] 不在允许的媒体目录内（TG_RICH_MEDIA_ROOTS）：{raw}"
+            )
+        # 凭证文件名 guard（第二层，保留不动）
         if _media_guard_on() and (
             _SENSITIVE_NAME_RE.search(path.name) or _SENSITIVE_NAME_RE.search(real.name)
         ):
@@ -555,8 +587,39 @@ def download_file(remote_path: str) -> bytes:
     return response.content
 
 
-def _resolve_chat(args: dict[str, Any]) -> str:
+def _allowed_chats() -> set[str]:
+    """`TG_RICH_ALLOWED_CHATS`（逗号分隔）解析成集合。未配＝空集＝不设限（现状）。"""
+    raw = (os.environ.get("TG_RICH_ALLOWED_CHATS") or "").strip()
+    if not raw:
+        return set()
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
+def _check_chat_allowed(chat: str) -> None:
+    """chat allowlist 的**唯一**校验点。配了名单就必须在名单里，否则拒。
+
+    报错**不泄露名单内容**——只说不在允许清单内。
+    """
+    allowed = _allowed_chats()
+    if allowed and chat not in allowed:
+        raise ValueError("目标 chat 不在允许清单内（TG_RICH_ALLOWED_CHATS）")
+
+
+def _resolve_chat_raw(args: dict[str, Any]) -> str:
+    """解析目标 chat（explicit 优先、其次默认），**不**强制非空；顺带过 allowlist。
+
+    这是 chat 解析的**唯一一条路径**：explicit chat 与默认 chat（TG_CHAT_ID /
+    配置文件）都从这里过 `_check_chat_allowed`，不会有一条绕开校验的旁路。
+    贴纸清单模式（没 emoji/id/query）允许空 chat，故单拎出「不强制非空」这一版。
+    """
     chat = str(args.get("chat_id") or "").strip() or _default_chat()
+    if chat:
+        _check_chat_allowed(chat)
+    return chat
+
+
+def _resolve_chat(args: dict[str, Any]) -> str:
+    chat = _resolve_chat_raw(args)
     if not chat:
         raise RuntimeError(
             f"没给 chat_id，也没配默认值（TG_CHAT_ID 或 {CONFIG_PATH} 的 chat_id）"
@@ -880,8 +943,9 @@ def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "tg_rich_draft":
         return _text(tool_draft(args))
     if name == "tg_sticker_send":
-        # 清单模式不该被「没配 chat_id」拦住——真要发的时候模块里再验
-        chat = str(args.get("chat_id") or "").strip() or _default_chat()
+        # 清单模式不该被「没配 chat_id」拦住——真要发的时候模块里再验。
+        # 但目标 chat 若给了/有默认，仍走同一个 allowlist 校验（_resolve_chat_raw）。
+        chat = _resolve_chat_raw(args)
         return _text(tg_sticker.tool_sticker_send(args, chat, _token(), call_api))
     if name == "tg_sticker_import":
         return _text(tg_sticker.tool_sticker_import(args, _token(), call_api, download_file))
