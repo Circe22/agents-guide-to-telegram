@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,6 +23,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install requests
+      # test_000_apply_r2_patch.py 会先把候选补丁应用到这个一次性 checkout；
+      # 后面的整套测试因此全部跑在“将要提交的代码”上，而不是旧树上。
       - run: python -m unittest discover -v
 
   # README 承诺 server 核心（tg_rich_mcp/tg_sticker/tg_ask/secret_redaction）
@@ -34,3 +39,37 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - run: python -m unittest discover -v
+
+  # 只有四档测试全部通过，才把同一份 bootstrap 补丁真正写回 PR 分支。
+  # 这里只提交最终代码/README/永久回归测试；临时脚手架由外部 Git tree
+  # 在下一步原子清理并恢复本 workflow，随后再跑一轮“无 bootstrap”的干净 CI。
+  finalize-r2:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs: [test, test-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Materialize the tested patch
+        run: python bootstrap_r2.py --finalize
+      - name: Re-run the full suite with permanent regression tests
+        run: |
+          python -m unittest discover -v
+          git diff --check
+      - name: Commit the tested source patch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          git config user.name "ChatGPT"
+          git config user.email "noreply@openai.com"
+          git add tg_rich_mcp.py README.md test_security_boundaries_r2.py
+          git commit -m "security: close second-order Telegram parsing boundaries"
+          git push origin "HEAD:$HEAD_REF"
