@@ -532,13 +532,16 @@ tg_ask_choice(question="午饭吃什么？", options=["面", "饺子", "随便"]
 | `mathematical_expression` | `expression`（裸 LaTeX） | ✅ |
 | `list` | `items[]`（每项 `blocks`，可加 `has_checkbox` / `is_checked`） | ✅ |
 | `blockquote` | `blocks[]`, `credit?` | ✅ |
+| `expandable_blockquote` | `text`, `credit?`（是 `text`，不是 `blocks`） | ✅ 10.3 |
 | `pullquote` | `text`, `credit?` | ✅ |
-| `table` | `cells[][]`, `is_bordered?`, `is_striped?`, `caption?` | ✅ |
+| `table` | `cells[][]`, `is_bordered?`, `is_striped?`, `is_compact?`, `caption?` | ✅（`is_compact` 10.3） |
+| `buttons` | `buttons[1-8]`, `align?`（每个按钮 `text` + 一个类型字段，如 `url` / `copy_text{text}`） | ✅ 10.3，callback 未测 |
 | `details` | `summary`, `blocks[]`, `is_open?` | ✅ |
 | `anchor` | `name`（配行内 `anchor_link` 做页内跳转） | ✅ |
 | `map` | `location{latitude,longitude}`, `zoom`, `width`, `height` | ✅ |
 | `collage` / `slideshow` | `blocks[]`, `caption?`（caption 是**对象**不是字符串） | ✅ |
 | `photo` | `photo`(InputMediaPhoto) + `caption?` | ✅ |
+| `document` | `document`(InputMediaDocument) + `caption?` | ✅ 10.3 |
 | `video` / `audio` / `animation` / `voice_note` | 对应 `InputMedia*` + `caption?` | 📖 未逐项实测 |
 | `thinking` | `text` | ⚠️ **仅 draft 可用** |
 

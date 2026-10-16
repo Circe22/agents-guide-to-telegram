@@ -654,3 +654,25 @@ tg_ask_choice(question="这道逻辑题选哪个？", options=["A", "B", "C", "D
 *本文的能力盘点由一份独立调研整理而来（对照 10.1/10.2 changelog、Rich Message
 文档与官方缺陷记录）；✅ 的部分是本项目真发出去验过的，📖 的没有逐个实测——
 照抄前自己发一条试试，比信文档快。*
+
+## 12. Bot API 10.3 新块：实测记录（2026-10-17，私聊）
+
+下面每一条都在真实私聊里发过、客户端看到了。没试的写明了为什么没试。
+
+| 能力 | 写法 | 结果 |
+|---|---|---|
+| 紧凑表格 | table 加 `"is_compact": true` | ✅ 单元格内边距更小，长表不那么撑 |
+| 可展开引用 | `{"type":"expandable_blockquote","text":…,"credit":…}`，或 HTML `<blockquote expandable>` | ✅ 注意字段是 **`text`**，不是 `blocks`；写成 blocks 会报 `RICH_MESSAGE_CONTENT_REQUIRED` |
+| 正文中间夹文件 | `{"type":"document","document":{"type":"document","media":"attach://f0"}}` + media_paths | ✅ 文件出现在两段文字中间，不是另起一条 |
+| 按钮行 | `{"type":"buttons","align":"center","buttons":[…]}`，每行 1–8 个 | ✅ 试了 copy_text 和 url 两种 |
+| 草稿 + 停止按钮 | tg_rich_draft 带 `can_stop`，同一 draft_id 连发多帧 | ✅ 动画过渡正常；停止事件本工具收不到 |
+| 临时消息 ephemeral | `ephemeral_message_parameters` | ⏸ 没试：它是群里只给指定成员看的消息，私聊里没意义；本工具也还没暴露这个参数 |
+| callback 按钮 | `"callback_data":"…"` | ⏸ 没试：按下去 Telegram 把数据送给 bot 的 callback_query。收信侧（官方 telegram 插件）只处理自己认识的前缀、其余直接 answer 掉，agent 收不到——发了就是一个按了没反应的按钮 |
+
+**按钮的坑**：
+
+- 每个按钮除了 `text`、`style`，**必须且只能**有一个决定类型的字段：`url` / `callback_data` / `copy_text` / `web_app` / `login_url` / `switch_inline_query*`。
+- `copy_text` 是对象：`{"text":"要复制的内容"}`（1–256 字符），不是字符串。
+- HTML 写法 `<tg-button type="copy_text" text="…">复制</tg-button>`，**`type` 属性必填**。漏了 type，不管写什么都报 `BUTTON_URL_INVALID`，很容易误以为是链接写错了。
+- `style` 只有 `danger` / `success` / `primary` / `link`，`link` 只给 callback 按钮用。
+- 按钮的 `text` 只能是纯文本、自定义表情、date_time，不能加粗。
