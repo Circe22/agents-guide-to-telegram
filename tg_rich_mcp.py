@@ -1072,7 +1072,14 @@ _RECIPES = (
     "   photo 的 media 还可以填 http(s) 外链或以前拿到的 file_id（复用不重传）。\n"
     "⑨ 地图（发个坐标给对方看）：\n"
     '   {"type":"map","location":{"latitude":63.4044,"longitude":-19.0588},'
-    '"zoom":12,"width":800,"height":500,"caption":{"text":"Reynisfjara 黑沙滩"}}'
+    '"zoom":12,"width":800,"height":500,"caption":{"text":"Reynisfjara 黑沙滩"}}\n'
+    "⑩ 按钮行（复制文本 / 打开链接）：\n"
+    '   {"type":"buttons","align":"center","buttons":[{"text":"复制","style":"success",'
+    '"copy_text":{"text":"要复制的内容"}},{"text":"打开","url":"https://example.com"}]}\n'
+    "   style 只有 danger/success/primary/link（link 仅限 callback 按钮）。"
+    "callback 按钮要收信侧能接 callback_query 才有意义，接不到就别发。\n"
+    "⑪ 文章中间夹一个文件：media_paths=[\"/a/report.pdf\"] + "
+    '{"type":"document","document":{"type":"document","media":"attach://f0"}}'
 )
 
 
@@ -1092,11 +1099,13 @@ _CONTENT_SCHEMA = {
             "块数组，最可控。**块级** type：paragraph / heading(size 1-6) / pre(language) / "
             "footer / divider / mathematical_expression(字段名是 expression，裸 LaTeX 不要包 $$) / "
             "list(items[]，支持 has_checkbox·is_checked) / blockquote(blocks[]·credit) / "
-            "pullquote(text·credit) / table(cells[][]·is_bordered·is_striped·caption) / "
+            "expandable_blockquote(text·credit，可展开引用，字段是 text 不是 blocks) / "
+            "pullquote(text·credit) / table(cells[][]·is_bordered·is_striped·is_compact·caption) / "
             "details(summary·blocks[]·is_open) / anchor(name) / "
             "map(location={latitude,longitude}·zoom 0-24·width·height) / "
             "collage·slideshow(blocks[]=photo 块数组·caption={text,credit}) / "
-            "photo·video·audio·animation·voice_note / "
+            "buttons(buttons[1-8]·align left|center|right，见配方⑩) / "
+            "photo·video·audio·animation·voice_note·document / "
             "thinking(仅 draft 可用)。"
             "媒体块的 media 三种来源：http(s) 外链 / 之前拿到的 file_id（复用不重传）/ "
             "attach://f0（配合 media_paths 上传本地文件，第 i 个路径＝f{i}）。"
